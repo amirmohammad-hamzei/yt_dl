@@ -1,0 +1,178 @@
+name: 🎬 YouTube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube Video URL'
+        required: true
+      quality:
+        description: 'Quality (best/1080/720/480/audio)'
+        required: false
+        default: 'best'
+      password:
+        description: 'Zip password (optional)'
+        required: false
+        default: ''
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Start WARP
+        run: |
+          docker network create warp-net 2>/dev/null || true
+          docker run -d --name warp --network warp-net \
+            -p 1080:1080 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          
+          echo "Waiting for WARP..."
+          for i in $(seq 1 15); do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "")
+            if echo "$RESULT" | grep -q "warp=on\|warp=plus"; then
+              echo "✅ WARP ready!"
+              break
+            fi
+            echo "  Attempt $i/15..."
+            sleep 10
+          done
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip ffmpeg zip curl jq bc
+          pip3 install -q --upgrade yt-dlp
+
+      - name: Download Video
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          PASSWORD="${{ github.event.inputs.password }}"
+          SPLIT_MB=90
+          
+          mkdir -p videos downloads
+          
+          echo "========================================"
+          echo "  YouTube Downloader"
+          echo "========================================"
+          echo "URL: $URL"
+          echo "Quality: $QUALITY"
+          
+          # Format selection
+          case "$QUALITY" in
+            audio) FMT="bestaudio" ;;
+            1080)  FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" ;;
+            720)   FMT="bestvideo[height<=720]+bestaudio/best[height<=720]/best" ;;
+            480)   FMT="bestvideo[height<=480]+bestaudio/best[height<=480]/best" ;;
+            *)     FMT="bestvideo+bestaudio/best" ;;
+          esac
+          
+          # 6 methods to try
+          download_try() {
+            local method=$1
+            echo "--- Method $method ---"
+            
+            case $method in
+              1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 "$URL" ;;
+              2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" -A "Mozilla/5.0 (Linux; Android 12)" "$URL" ;;
+              3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" -A "Mozilla/5.0 (iPhone)" "$URL" ;;
+              4) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=web" -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$URL" ;;
+              5) yt-dlp -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --no-check-certificates -A "Mozilla/5.0 (Macintosh)" "$URL" ;;
+              6) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=tv_embedded" "$URL" ;;
+            esac
+          }
+          
+          SUCCESS=false
+          for m in 1 2 3 4 5 6; do
+            if download_try $m; then
+              SUCCESS=true
+              echo "✅ Method $m worked!"
+              break
+            fi
+            echo "❌ Method $m failed"
+            sleep 5
+          done
+          
+          if [ "$SUCCESS" = false ]; then
+            echo "All methods failed!"
+            exit 1
+          fi
+          
+          # Process files
+          for FILE in downloads/*; do
+            [ -f "$FILE" ] || continue
+            BASENAME=$(basename "$FILE")
+            NAME="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            SIZE=$(stat -c%s "$FILE")
+            SIZE_MB=$((SIZE / 1024 / 1024))
+            
+            echo "Processing: $BASENAME (${SIZE_MB}MB)"
+            
+            FOLDER="videos/$NAME"
+            mkdir -p "$FOLDER"
+            
+            if [ "$SIZE" -gt $((SPLIT_MB * 1024 * 1024)) ]; then
+              # Split large files
+              cd downloads
+              if [ -n "$PASSWORD" ]; then
+                zip -0 -s "${SPLIT_MB}m" -P "$PASSWORD" "$NAME.zip" "$BASENAME"
+              else
+                zip -0 -s "${SPLIT_MB}m" "$NAME.zip" "$BASENAME"
+              fi
+              mv "$NAME".z* "../$FOLDER/" 2>/dev/null
+              mv "$NAME.zip" "../$FOLDER/" 2>/dev/null
+              rm -f "$BASENAME"
+              cd ..
+            else
+              # Zip
+              if [ -n "$PASSWORD" ]; then
+                zip -j -P "$PASSWORD" "$FOLDER/$NAME.zip" "$FILE"
+              else
+                cp "$FILE" "$FOLDER/$BASENAME"
+              fi
+              rm -f "$FILE"
+            fi
+            
+            echo "  → $FOLDER"
+          done
+          
+          rm -rf downloads
+          
+          echo "Done! Files in videos/"
+
+      - name: Stop WARP
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          
+          git add videos/
+          
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          
+          git commit -m "📥 Download YouTube video [skip ci]"
+          git pull --rebase origin main 2>/dev/null || true
+          git push origin main
+          
+          echo "✅ Saved to repository!"
