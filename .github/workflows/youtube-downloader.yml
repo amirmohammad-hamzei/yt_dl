@@ -66,11 +66,27 @@ jobs:
           
           echo "⚠️ WARP may not be ready, continuing anyway..."
 
-      - name: Install Tools
+      - name: Install Tools (Fast)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-pip ffmpeg zip unzip p7zip-full curl jq bc wget
-          pip3 install -q --upgrade yt-dlp
+          echo "Installing tools..."
+          
+          # These are already on Ubuntu runner, just need yt-dlp and 7z
+          # ffmpeg, zip, unzip, curl, wget, jq, bc - all pre-installed!
+          
+          # Install only what's missing
+          sudo apt-get install -y -qq p7zip-full python3-pip 2>/dev/null &
+          wait
+          
+          # Install yt-dlp
+          pip3 install -q --no-cache-dir yt-dlp 2>/dev/null &
+          wait
+          
+          echo "✅ Tools ready!"
+          
+          # Verify
+          echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 || echo 'missing')"
+          echo "yt-dlp: $(yt-dlp --version 2>/dev/null || echo 'missing')"
+          echo "7z: $(7z --help 2>/dev/null | head -1 || echo 'missing')"
 
       - name: Download YouTube Video
         env:
@@ -114,113 +130,85 @@ jobs:
               ;;
           esac
           
-          # Download function with retry
-          download_video() {
+          # Download function
+          try_download() {
             local method="$1"
             local extra_args="$2"
+            local use_proxy="${3:-true}"
             
-            echo "Method $method: Trying..."
+            echo "▶ Method $method..."
+            
+            if [ "$use_proxy" = true ]; then
+              PROXY="--proxy socks5://127.0.0.1:1080"
+            else
+              PROXY=""
+            fi
             
             if [ "$IS_AUDIO" = true ]; then
-              yt-dlp \
-                --proxy socks5://127.0.0.1:1080 \
+              yt-dlp $PROXY \
                 -f "$FMT" \
                 -o "%(title)s.%(ext)s" \
                 --no-playlist \
-                --retries 5 \
-                --fragment-retries 5 \
+                --retries 3 \
+                --fragment-retries 3 \
                 --no-check-certificates \
+                --user-agent "Mozilla/5.0" \
                 $extra_args \
-                "$URL" 2>&1 | tail -5
+                "$URL" 2>&1 | grep -E "(Downloading|Merging|has already been)" || true
             else
-              yt-dlp \
-                --proxy socks5://127.0.0.1:1080 \
+              yt-dlp $PROXY \
                 -f "$FMT" \
                 --merge-output-format mp4 \
                 -o "%(title)s.mp4" \
                 --no-playlist \
-                --retries 5 \
-                --fragment-retries 5 \
+                --retries 3 \
+                --fragment-retries 3 \
                 --no-check-certificates \
+                --user-agent "Mozilla/5.0" \
                 $extra_args \
-                "$URL" 2>&1 | tail -5
+                "$URL" 2>&1 | grep -E "(Downloading|Merging|has already been)" || true
+            fi
+            
+            if [ "$(ls -A . 2>/dev/null)" ]; then
+              return 0
+            else
+              return 1
             fi
           }
           
-          SUCCESS=false
-          
-          # Method 1: Normal with WARP
-          if download_video 1 ""; then
-            [ "$(ls -A . 2>/dev/null)" ] && SUCCESS=true
-          fi
-          
-          # Method 2: Android client
-          if [ "$SUCCESS" = false ]; then
-            if download_video 2 "--extractor-args youtube:player_client=android"; then
-              [ "$(ls -A . 2>/dev/null)" ] && SUCCESS=true
-            fi
-          fi
-          
-          # Method 3: iOS client
-          if [ "$SUCCESS" = false ]; then
-            if download_video 3 "--extractor-args youtube:player_client=ios"; then
-              [ "$(ls -A . 2>/dev/null)" ] && SUCCESS=true
-            fi
-          fi
-          
-          # Method 4: TV embedded client
-          if [ "$SUCCESS" = false ]; then
-            if download_video 4 "--extractor-args youtube:player_client=tv_embedded"; then
-              [ "$(ls -A . 2>/dev/null)" ] && SUCCESS=true
-            fi
-          fi
-          
-          # Method 5: Without proxy
-          if [ "$SUCCESS" = false ]; then
-            echo "Method 5: Direct (no proxy)..."
-            if [ "$IS_AUDIO" = true ]; then
-              yt-dlp -f "$FMT" -o "%(title)s.%(ext)s" --no-playlist --retries 5 "$URL" 2>&1 | tail -5
-            else
-              yt-dlp -f "$FMT" --merge-output-format mp4 -o "%(title)s.mp4" --no-playlist --retries 5 "$URL" 2>&1 | tail -5
-            fi
-            [ "$(ls -A . 2>/dev/null)" ] && SUCCESS=true
-          fi
-          
-          if [ "$SUCCESS" = false ]; then
+          # Try all methods
+          try_download 1 "" true || \
+          try_download 2 "--extractor-args youtube:player_client=android" true || \
+          try_download 3 "--extractor-args youtube:player_client=ios" true || \
+          try_download 4 "--extractor-args youtube:player_client=web" true || \
+          try_download 5 "" false || {
             echo "❌ ALL METHODS FAILED!"
             exit 1
-          fi
+          }
           
           echo ""
-          echo "✅ Download successful!"
+          echo "✅ Downloaded:"
+          ls -lh
           
-          # Convert audio to MP3 if needed
+          # Convert audio to MP3
           if [ "$IS_AUDIO" = true ]; then
             echo ""
             echo "Converting to MP3 320kbps..."
             for f in *; do
               [ -f "$f" ] || continue
               name="${f%.*}"
-              echo "  Processing: $f"
-              ffmpeg -i "$f" -vn -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "${name}.mp3" -y 2>/dev/null
-              if [ -f "${name}.mp3" ]; then
-                rm -f "$f"
-                echo "  → ${name}.mp3"
-              fi
+              ffmpeg -i "$f" -vn -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "${name}.mp3" -y 2>/dev/null &
             done
+            wait
+            rm -f *.m4a *.webm *.opus 2>/dev/null
+            echo "✅ Converted:"
+            ls -lh
           fi
-          
-          # Show what we got
-          echo ""
-          echo "Downloaded files:"
-          ls -lh
 
-      - name: Convert to H.264
+      - name: Convert to H.264 (Fast)
         if: success()
         run: |
-          echo "========================================"
-          echo "  Converting to H.264 (if needed)"
-          echo "========================================"
+          echo "Converting to H.264..."
           
           cd downloads
           
@@ -229,17 +217,14 @@ jobs:
             ext="${f##*.}"
             name="${f%.*}"
             
-            # Check if video needs conversion
             if [ "$ext" = "mp4" ] || [ "$ext" = "mkv" ] || [ "$ext" = "webm" ]; then
-              echo "Checking: $f"
-              
-              # Check if already H.264
-              codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null)
+              # Quick check using ffprobe
+              codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
               
               if [ "$codec" != "h264" ]; then
-                echo "  Converting from $codec to H.264..."
+                echo "Converting $f ($codec → h264)..."
                 ffmpeg -i "$f" \
-                  -c:v libx264 -preset fast -crf 23 \
+                  -c:v libx264 -preset ultrafast -crf 23 \
                   -c:a aac -b:a 128k \
                   -movflags +faststart \
                   -pix_fmt yuv420p \
@@ -248,16 +233,16 @@ jobs:
                 if [ -f "${name}_h264.mp4" ]; then
                   rm -f "$f"
                   mv "${name}_h264.mp4" "$f"
-                  echo "  ✅ Converted to H.264"
+                  echo "  ✅ Done"
                 fi
               else
-                echo "  Already H.264, skipping"
+                echo "  $f: Already H.264, skip"
               fi
             fi
           done
           
           cd ..
-          echo "Conversion complete!"
+          echo "✅ Conversion complete!"
 
       - name: Package and Split
         if: success()
@@ -265,9 +250,7 @@ jobs:
           SPLIT_MB=90
           PASSWORD="${{ github.event.inputs.password }}"
           
-          echo "========================================"
-          echo "  Packaging Files"
-          echo "========================================"
+          echo "Packaging files..."
           
           rm -rf output
           mkdir -p output
@@ -281,13 +264,12 @@ jobs:
             size=$(stat -c%s "$f")
             size_mb=$((size / 1024 / 1024))
             
-            echo "Processing: $f (${size_mb}MB)"
+            echo "→ $f (${size_mb}MB)"
             
             out_dir="../output/${name}"
             mkdir -p "$out_dir"
             
-            # Step 1: Always create ZIP first (for consistency)
-            echo "  Creating ZIP..."
+            # Create ZIP
             zip_file="${name}.zip"
             
             if [ -n "$PASSWORD" ]; then
@@ -297,23 +279,22 @@ jobs:
             fi
             
             if [ ! -f "../${zip_file}" ]; then
-              echo "  ❌ ZIP failed, copying original"
+              echo "  ⚠️ ZIP failed, copying original"
               cp "$f" "$out_dir/"
               continue
             fi
             
             zip_size=$(stat -c%s "../${zip_file}")
             zip_size_mb=$((zip_size / 1024 / 1024))
-            echo "  ZIP size: ${zip_size_mb}MB"
             
-            # Step 2: Split if > 90MB using 7z (creates .zip.001, .zip.002, ...)
+            # Split if > 90MB
             if [ "$zip_size" -gt 94371840 ]; then
-              echo "  Splitting into ${SPLIT_MB}MB parts..."
+              echo "  Splitting ${zip_size_mb}MB → ${SPLIT_MB}MB parts..."
               
               mv "../${zip_file}" "$out_dir/"
               cd "$out_dir"
               
-              # Use 7z to create multi-volume ZIP
+              # 7z multi-volume ZIP
               if [ -n "$PASSWORD" ]; then
                 7z a -tzip -v${SPLIT_MB}m -p"$PASSWORD" -mhe=on "${name}.zip" "${zip_file}" > /dev/null 2>&1
               else
@@ -322,74 +303,43 @@ jobs:
               
               if ls "${name}.zip".* >/dev/null 2>&1; then
                 rm -f "${zip_file}"
-                part_count=$(ls -1 "${name}.zip".* 2>/dev/null | wc -l)
-                echo "  ✅ Split into ${part_count} parts"
-                
-                # List parts
-                ls -lh "${name}.zip".*
+                parts=$(ls -1 "${name}.zip".* | wc -l)
+                echo "  ✅ ${parts} parts created"
               else
-                echo "  ⚠️ Split failed, keeping full ZIP"
+                echo "  ⚠️ Split failed, keeping original"
                 mv "${zip_file}" "../${name}.zip"
               fi
               
               cd ../../downloads
             else
-              # Under 90MB, just move the ZIP
               mv "../${zip_file}" "$out_dir/"
-              echo "  ✅ Single file (no split needed)"
+              echo "  ✅ No split needed"
             fi
             
-            # Cleanup original
             rm -f "$f"
-            echo ""
           done
           
           cd ..
           rm -rf downloads
           
           echo ""
-          echo "========================================"
-          echo "  Final Files"
-          echo "========================================"
+          echo "✅ Files ready:"
           find output -type f -exec ls -lh {} \;
           
-          # Create README for each split
+          # Create README for split files
           for dir in output/*/; do
             [ -d "$dir" ] || continue
-            
             if ls "$dir"/*.zip.* >/dev/null 2>&1; then
               dname=$(basename "$dir")
-              
-              cat > "$dir/README.md" << EOF
-          # 📦 Multi-Volume ZIP Archive
-          
-          **File:** ${dname}.zip
-          **Format:** 7z Multi-Volume ZIP
-          
-          ## ✨ Open directly - no joining needed!
-          
-          ### 📱 Android
-          Open **${dname}.zip.001** with **ZArchiver**
-          
-          ### 📱 iOS  
-          Open **${dname}.zip.001** with **iZip**
-          
-          ### 🖥️ Windows
-          Right-click **${dname}.zip.001** → **7-Zip** → Extract
-          
-          ### 🖥️ macOS
-          Double-click **${dname}.zip.001** (The Unarchiver)
-          
-          ### 🐧 Linux
-          \`7z x ${dname}.zip.001\`
-          
-          ## ⚠️ Important
-          - Download ALL parts to the **same folder**
-          - Open the **FIRST part** (.zip.001)
-          - The program reads all parts automatically
-          EOF
-              
-              echo "  ✅ README created for $dname"
+              echo "## 📦 ${dname}" > "$dir/README.md"
+              echo "" >> "$dir/README.md"
+              echo "**Open \`.zip.001\` with:**" >> "$dir/README.md"
+              echo "- 📱 Android: **ZArchiver**" >> "$dir/README.md"
+              echo "- 📱 iOS: **iZip**" >> "$dir/README.md"
+              echo "- 🖥️ Windows: **7-Zip**" >> "$dir/README.md"
+              echo "- 🍎 Mac: **The Unarchiver**" >> "$dir/README.md"
+              echo "" >> "$dir/README.md"
+              echo "Download ALL parts to same folder first!" >> "$dir/README.md"
             fi
           done
 
@@ -402,51 +352,32 @@ jobs:
       - name: Save to Repository
         if: success()
         run: |
-          echo "Saving to GitHub..."
-          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           git add output/ 2>/dev/null || true
           
           if git diff --cached --quiet 2>/dev/null; then
-            echo "No files to save!"
+            echo "No files to save"
             exit 0
           fi
           
-          git commit -m "📥 Downloaded YouTube video [skip ci]" 2>/dev/null || true
-          
-          echo "Pushing..."
+          git commit -m "📥 Download [skip ci]" 2>/dev/null || true
           git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || true
-          
-          for i in 1 2 3; do
-            git push origin HEAD:${{ github.ref_name }} 2>/dev/null && break
-            echo "Retry $i..."
-            sleep 5
-          done
-          
-          echo ""
-          echo "========================================"
-          echo "  ✅ FILES SAVED!"
-          echo "========================================"
-          echo ""
-          echo "Download from:"
-          echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/output"
-          echo ""
-          echo "Files:"
-          find output -type f -exec ls -lh {} \;
+          git push origin HEAD:${{ github.ref_name }} 2>/dev/null && echo "✅ Saved!" || echo "Push failed"
 
-      - name: Show Summary
-        if: always()
+      - name: Show Result
         run: |
           echo ""
           echo "=========================================="
-          echo "  🎉 COMPLETE!"
+          echo "  ✅ COMPLETE"
           echo "=========================================="
           echo ""
-          echo "📁 Your files:"
-          find output -type f -name "*.zip" -o -name "*.zip.*" 2>/dev/null | while read f; do
+          echo "📁 Download from:"
+          echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/output"
+          echo ""
+          find output -type f -name "*.zip" -o -name "*.zip.*" | while read f; do
             ls -lh "$f"
           done
           echo ""
-          echo "📱 Open .zip.001 with ZArchiver or 7-Zip!"
+          echo "📱 Open .zip.001 with ZArchiver/7-Zip!"
