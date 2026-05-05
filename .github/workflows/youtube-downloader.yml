@@ -70,28 +70,56 @@ jobs:
           echo "URL: $URL"
           echo "Quality: $QUALITY"
           
-          # Format selection
+          # Format selection - FIXED
           case "$QUALITY" in
-            audio) FMT="bestaudio" ;;
-            1080)  FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" ;;
-            720)   FMT="bestvideo[height<=720]+bestaudio/best[height<=720]/best" ;;
-            480)   FMT="bestvideo[height<=480]+bestaudio/best[height<=480]/best" ;;
-            *)     FMT="bestvideo+bestaudio/best" ;;
+            audio)
+              FMT="bestaudio[ext=m4a]/bestaudio"
+              IS_AUDIO=true
+              ;;
+            1080)
+              FMT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio/best[height<=1080][ext=mp4]/best[height<=1080]"
+              IS_AUDIO=false
+              ;;
+            720)
+              FMT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]"
+              IS_AUDIO=false
+              ;;
+            480)
+              FMT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480][ext=mp4]+bestaudio/best[height<=480][ext=mp4]/best[height<=480]"
+              IS_AUDIO=false
+              ;;
+            *)
+              FMT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/bestvideo+bestaudio/best"
+              IS_AUDIO=false
+              ;;
           esac
           
-          # 6 methods to try
+          # Download methods
           download_try() {
             local method=$1
             echo "--- Method $method ---"
             
-            case $method in
-              1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 "$URL" ;;
-              2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" -A "Mozilla/5.0 (Linux; Android 12)" "$URL" ;;
-              3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" -A "Mozilla/5.0 (iPhone)" "$URL" ;;
-              4) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=web" -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$URL" ;;
-              5) yt-dlp -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --no-check-certificates -A "Mozilla/5.0 (Macintosh)" "$URL" ;;
-              6) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=tv_embedded" "$URL" ;;
-            esac
+            if [ "$IS_AUDIO" = true ]; then
+              # Audio: download then convert to MP3
+              case $method in
+                1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 "$URL" ;;
+                2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" -A "Mozilla/5.0" "$URL" ;;
+                3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" -A "Mozilla/5.0" "$URL" ;;
+                4) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=web" -A "Mozilla/5.0" "$URL" ;;
+                5) yt-dlp -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --no-check-certificates -A "Mozilla/5.0" "$URL" ;;
+                6) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=tv_embedded" "$URL" ;;
+              esac
+            else
+              # Video: download + merge to MP4
+              case $method in
+                1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 "$URL" ;;
+                2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" -A "Mozilla/5.0" "$URL" ;;
+                3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" -A "Mozilla/5.0" "$URL" ;;
+                4) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=web" -A "Mozilla/5.0" "$URL" ;;
+                5) yt-dlp -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --no-check-certificates -A "Mozilla/5.0" "$URL" ;;
+                6) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=tv_embedded" "$URL" ;;
+              esac
+            fi
           }
           
           SUCCESS=false
@@ -110,6 +138,19 @@ jobs:
             exit 1
           fi
           
+          # Convert audio to MP3 if needed
+          if [ "$IS_AUDIO" = true ]; then
+            echo "Converting to MP3 320kbps..."
+            for FILE in downloads/*; do
+              [ -f "$FILE" ] || continue
+              BASENAME=$(basename "$FILE")
+              NAME="${BASENAME%.*}"
+              ffmpeg -i "$FILE" -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "downloads/${NAME}.mp3" -y 2>/dev/null
+              rm -f "$FILE"
+              echo "  ✅ ${NAME}.mp3"
+            done
+          fi
+          
           # Process files
           for FILE in downloads/*; do
             [ -f "$FILE" ] || continue
@@ -121,11 +162,15 @@ jobs:
             
             echo "Processing: $BASENAME (${SIZE_MB}MB)"
             
-            FOLDER="videos/$NAME"
+            # Choose output folder
+            if [ "$IS_AUDIO" = true ]; then
+              FOLDER="music/$NAME"
+            else
+              FOLDER="videos/$NAME"
+            fi
             mkdir -p "$FOLDER"
             
             if [ "$SIZE" -gt $((SPLIT_MB * 1024 * 1024)) ]; then
-              # Split large files
               cd downloads
               if [ -n "$PASSWORD" ]; then
                 zip -0 -s "${SPLIT_MB}m" -P "$PASSWORD" "$NAME.zip" "$BASENAME"
@@ -137,7 +182,6 @@ jobs:
               rm -f "$BASENAME"
               cd ..
             else
-              # Zip
               if [ -n "$PASSWORD" ]; then
                 zip -j -P "$PASSWORD" "$FOLDER/$NAME.zip" "$FILE"
               else
@@ -151,28 +195,4 @@ jobs:
           
           rm -rf downloads
           
-          echo "Done! Files in videos/"
-
-      - name: Stop WARP
-        if: always()
-        run: |
-          docker stop warp 2>/dev/null || true
-          docker rm warp 2>/dev/null || true
-
-      - name: Commit
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "actions@github.com"
-          
-          git add videos/
-          
-          if git diff --cached --quiet; then
-            echo "No changes"
-            exit 0
-          fi
-          
-          git commit -m "📥 Download YouTube video [skip ci]"
-          git pull --rebase origin main 2>/dev/null || true
-          git push origin main
-          
-          echo "✅ Saved to repository!"
+          echo "Done!"
