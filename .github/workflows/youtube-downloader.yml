@@ -24,28 +24,54 @@ jobs:
     
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
 
       - name: Start WARP
         run: |
+          echo "Starting WARP..."
+          
+          # Install Docker if not available
+          if ! command -v docker &> /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq docker.io
+            sudo systemctl start docker
+            sudo usermod -aG docker $USER
+          fi
+          
           docker network create warp-net 2>/dev/null || true
-          docker run -d --name warp --network warp-net \
-            -p 1080:1080 --cap-add NET_ADMIN \
+          
+          docker run -d \
+            --name warp \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
             --sysctl net.ipv6.conf.all.disable_ipv6=0 \
             --sysctl net.ipv4.conf.all.src_valid_mark=1 \
             -v warp-data:/var/lib/cloudflare-warp \
-            caomingjun/warp
+            caomingjun/warp 2>/dev/null || {
+              echo "Retrying WARP container..."
+              docker rm -f warp 2>/dev/null
+              docker run -d \
+                --name warp \
+                --network warp-net \
+                -p 1080:1080 \
+                --cap-add NET_ADMIN \
+                --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+                --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+                caomingjun/warp
+            }
           
-          echo "Waiting for WARP..."
-          for i in $(seq 1 15); do
+          echo "Waiting for WARP to connect..."
+          sleep 15
+          
+          # Check WARP
+          for i in $(seq 1 10); do
             RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "")
-            if echo "$RESULT" | grep -q "warp=on\|warp=plus"; then
-              echo "✅ WARP ready!"
+            if echo "$RESULT" | grep -q "warp"; then
+              echo "✅ WARP connected!"
+              echo "$RESULT"
               break
             fi
-            echo "  Attempt $i/15..."
+            echo "  Waiting... ($i/10)"
             sleep 10
           done
 
@@ -55,14 +81,14 @@ jobs:
           sudo apt-get install -y -qq python3-pip ffmpeg zip curl jq bc
           pip3 install -q --upgrade yt-dlp
 
-      - name: Download Video
+      - name: Download
         run: |
           URL="${{ github.event.inputs.url }}"
           QUALITY="${{ github.event.inputs.quality }}"
           PASSWORD="${{ github.event.inputs.password }}"
           SPLIT_MB=90
           
-          mkdir -p videos downloads
+          mkdir -p downloads output
           
           echo "========================================"
           echo "  YouTube Downloader"
@@ -70,7 +96,7 @@ jobs:
           echo "URL: $URL"
           echo "Quality: $QUALITY"
           
-          # Format selection - FIXED
+          # Format
           case "$QUALITY" in
             audio)
               FMT="bestaudio[ext=m4a]/bestaudio"
@@ -94,105 +120,113 @@ jobs:
               ;;
           esac
           
-          # Download methods
-          download_try() {
-            local method=$1
-            echo "--- Method $method ---"
+          echo "Format: $FMT"
+          echo "Audio mode: $IS_AUDIO"
+          
+          # Download function
+          dl() {
+            local m=$1
+            echo "--- Method $m ---"
             
             if [ "$IS_AUDIO" = true ]; then
-              # Audio: download then convert to MP3
-              case $method in
-                1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 "$URL" ;;
-                2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" -A "Mozilla/5.0" "$URL" ;;
-                3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" -A "Mozilla/5.0" "$URL" ;;
+              case $m in
+                1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --no-check-certificates "$URL" ;;
+                2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" "$URL" ;;
+                3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" "$URL" ;;
                 4) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=web" -A "Mozilla/5.0" "$URL" ;;
-                5) yt-dlp -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --no-check-certificates -A "Mozilla/5.0" "$URL" ;;
+                5) yt-dlp -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 -A "Mozilla/5.0" "$URL" ;;
                 6) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" -o "downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --extractor-args "youtube:player_client=tv_embedded" "$URL" ;;
               esac
             else
-              # Video: download + merge to MP4
-              case $method in
-                1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 "$URL" ;;
-                2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" -A "Mozilla/5.0" "$URL" ;;
-                3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" -A "Mozilla/5.0" "$URL" ;;
+              case $m in
+                1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --no-check-certificates "$URL" ;;
+                2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=android" "$URL" ;;
+                3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=ios" "$URL" ;;
                 4) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=web" -A "Mozilla/5.0" "$URL" ;;
-                5) yt-dlp -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --no-check-certificates -A "Mozilla/5.0" "$URL" ;;
+                5) yt-dlp -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 -A "Mozilla/5.0" "$URL" ;;
                 6) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FMT" --merge-output-format mp4 -o "downloads/%(title)s.mp4" --no-playlist --retries 10 --extractor-args "youtube:player_client=tv_embedded" "$URL" ;;
               esac
             fi
           }
           
-          SUCCESS=false
+          # Try all methods
+          OK=false
           for m in 1 2 3 4 5 6; do
-            if download_try $m; then
-              SUCCESS=true
-              echo "✅ Method $m worked!"
+            if dl $m; then
+              OK=true
+              echo "✅ Method $m OK"
               break
             fi
             echo "❌ Method $m failed"
-            sleep 5
+            sleep 3
           done
           
-          if [ "$SUCCESS" = false ]; then
-            echo "All methods failed!"
+          if [ "$OK" = false ]; then
+            echo "FATAL: All methods failed!"
             exit 1
           fi
           
-          # Convert audio to MP3 if needed
+          # Convert audio to MP3
           if [ "$IS_AUDIO" = true ]; then
-            echo "Converting to MP3 320kbps..."
-            for FILE in downloads/*; do
-              [ -f "$FILE" ] || continue
-              BASENAME=$(basename "$FILE")
-              NAME="${BASENAME%.*}"
-              ffmpeg -i "$FILE" -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "downloads/${NAME}.mp3" -y 2>/dev/null
-              rm -f "$FILE"
-              echo "  ✅ ${NAME}.mp3"
+            echo "Converting to MP3..."
+            for f in downloads/*; do
+              [ -f "$f" ] || continue
+              name=$(basename "$f")
+              base="${name%.*}"
+              ffmpeg -i "$f" -vn -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "downloads/${base}.mp3" -y 2>/dev/null
+              rm -f "$f"
+              echo "  ✅ ${base}.mp3"
             done
           fi
           
           # Process files
-          for FILE in downloads/*; do
-            [ -f "$FILE" ] || continue
-            BASENAME=$(basename "$FILE")
-            NAME="${BASENAME%.*}"
-            EXT="${BASENAME##*.}"
-            SIZE=$(stat -c%s "$FILE")
-            SIZE_MB=$((SIZE / 1024 / 1024))
+          for f in downloads/*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            name="${base%.*}"
+            ext="${base##*.}"
+            size=$(stat -c%s "$f")
+            mb=$((size / 1024 / 1024))
             
-            echo "Processing: $BASENAME (${SIZE_MB}MB)"
+            echo "→ $base (${mb}MB)"
             
-            # Choose output folder
-            if [ "$IS_AUDIO" = true ]; then
-              FOLDER="music/$NAME"
-            else
-              FOLDER="videos/$NAME"
-            fi
-            mkdir -p "$FOLDER"
+            folder="output/$name"
+            mkdir -p "$folder"
             
-            if [ "$SIZE" -gt $((SPLIT_MB * 1024 * 1024)) ]; then
+            if [ "$size" -gt $((SPLIT_MB * 1024 * 1024)) ]; then
               cd downloads
               if [ -n "$PASSWORD" ]; then
-                zip -0 -s "${SPLIT_MB}m" -P "$PASSWORD" "$NAME.zip" "$BASENAME"
+                zip -0 -s "${SPLIT_MB}m" -P "$PASSWORD" "$name.zip" "$base"
               else
-                zip -0 -s "${SPLIT_MB}m" "$NAME.zip" "$BASENAME"
+                zip -0 -s "${SPLIT_MB}m" "$name.zip" "$base"
               fi
-              mv "$NAME".z* "../$FOLDER/" 2>/dev/null
-              mv "$NAME.zip" "../$FOLDER/" 2>/dev/null
-              rm -f "$BASENAME"
+              mv "$name".z* "../$folder/" 2>/dev/null
+              mv "$name.zip" "../$folder/" 2>/dev/null
               cd ..
             else
               if [ -n "$PASSWORD" ]; then
-                zip -j -P "$PASSWORD" "$FOLDER/$NAME.zip" "$FILE"
+                zip -j -P "$PASSWORD" "$folder/$name.zip" "$f"
               else
-                cp "$FILE" "$FOLDER/$BASENAME"
+                cp "$f" "$folder/$base"
               fi
-              rm -f "$FILE"
             fi
-            
-            echo "  → $FOLDER"
+            rm -f "$f"
           done
           
-          rm -rf downloads
-          
-          echo "Done!"
+          echo "Done! Output in output/"
+
+      - name: Stop WARP
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add output/
+          git commit -m "📥 Download [skip ci]" 2>/dev/null || true
+          git pull --rebase origin main 2>/dev/null || true
+          git push origin main
+          echo "✅ Saved!"
