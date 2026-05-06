@@ -59,10 +59,6 @@ jobs:
           for i in $(seq 1 20); do
             if curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp"; then
               echo "✅ WARP connected!"
-              # Test YouTube access
-              if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://www.youtube.com/ 2>/dev/null | grep -q "youtube"; then
-                echo "✅ YouTube accessible via WARP!"
-              fi
               exit 0
             fi
             echo "  Attempt $i/20..."
@@ -73,11 +69,17 @@ jobs:
 
       - name: Install Tools
         run: |
-          echo "Installing tools..."
+          echo "Installing ALL required tools..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 zip unzip p7zip-full python3-pip
+          # 👇 نصب ffmpeg که قبلاً فراموش شده بود
+          sudo apt-get install -y -qq aria2 zip unzip p7zip-full python3-pip ffmpeg
           pip3 install -q yt-dlp
+          
+          # Verify installations
           echo "✅ Tools ready!"
+          echo "yt-dlp: $(yt-dlp --version 2>/dev/null || echo 'FAILED')"
+          echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 || echo 'FAILED')"
+          echo "aria2c: $(aria2c --version 2>/dev/null | head -1 || echo 'FAILED')"
 
       - name: Download & Process YouTube Video
         env:
@@ -138,7 +140,7 @@ jobs:
             local client="$2"
             local use_proxy="${3:-true}"
             
-            echo "▶ Trying method $method (client: $client)..." | tee -a "$PROCESS_LOG"
+            echo "▶ Method $method (client: $client, proxy: $use_proxy)..." | tee -a "$PROCESS_LOG"
             
             if [ "$use_proxy" = true ]; then
               PROXY_ARG="--proxy $PROXY"
@@ -162,7 +164,7 @@ jobs:
                 --no-check-certificates \
                 --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
                 $CLIENT_ARG \
-                "$URL" 2>&1 | grep -E "(Downloading|Merging|has already been|ERROR)" | head -5 || true
+                "$URL" 2>&1 | tail -3
             else
               yt-dlp $PROXY_ARG \
                 -f "$FMT" \
@@ -174,28 +176,28 @@ jobs:
                 --no-check-certificates \
                 --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
                 $CLIENT_ARG \
-                "$URL" 2>&1 | grep -E "(Downloading|Merging|has already been|ERROR)" | head -5 || true
+                "$URL" 2>&1 | tail -3
             fi
             
-            # Check if download succeeded
-            if [ "$(ls -A . 2>/dev/null)" ]; then
-              return 0
-            else
-              return 1
-            fi
+            [ "$(ls -A . 2>/dev/null)" ] && return 0 || return 1
           }
           
           # Try all combinations
           DOWNLOAD_SUCCESS=false
           
-          try_download 1 "android" true && DOWNLOAD_SUCCESS=true
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then try_download 2 "ios" true && DOWNLOAD_SUCCESS=true; fi
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then try_download 3 "web" true && DOWNLOAD_SUCCESS=true; fi
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then try_download 4 "default" true && DOWNLOAD_SUCCESS=true; fi
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then try_download 5 "android" false && DOWNLOAD_SUCCESS=true; fi
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then try_download 6 "ios" false && DOWNLOAD_SUCCESS=true; fi
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then try_download 7 "web" false && DOWNLOAD_SUCCESS=true; fi
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then try_download 8 "default" false && DOWNLOAD_SUCCESS=true; fi
+          # اول با پروکسی تمام client ها رو امتحان کن
+          for client in android ios web default; do
+            if [ "$DOWNLOAD_SUCCESS" = false ]; then
+              try_download "proxy-$client" "$client" true && DOWNLOAD_SUCCESS=true
+            fi
+          done
+          
+          # بعد بدون پروکسی
+          for client in android ios web default; do
+            if [ "$DOWNLOAD_SUCCESS" = false ]; then
+              try_download "direct-$client" "$client" false && DOWNLOAD_SUCCESS=true
+            fi
+          done
           
           if [ "$DOWNLOAD_SUCCESS" = false ] || [ ! "$(ls -A . 2>/dev/null)" ]; then
             echo "❌ FAILED: Could not download video" | tee -a "$PROCESS_LOG"
@@ -211,54 +213,62 @@ jobs:
           if [ "$IS_AUDIO" = true ]; then
             echo "🎵 Converting to MP3 320kbps..." | tee -a "$PROCESS_LOG"
             name="${downloaded_file%.*}"
-            ffmpeg -i "$downloaded_file" -vn -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "${name}.mp3" -y 2>/dev/null
+            
+            # 👇 چک کردن اینکه ffmpeg واقعاً هست
+            if ! command -v ffmpeg &> /dev/null; then
+              echo "❌ ffmpeg not found! Installing..."
+              sudo apt-get install -y -qq ffmpeg
+            fi
+            
+            ffmpeg -i "$downloaded_file" -vn -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "${name}.mp3" -y 2>&1 | tail -2
             
             if [ -s "${name}.mp3" ]; then
               rm -f "$downloaded_file"
               downloaded_file="${name}.mp3"
               size=$(stat -c%s "$downloaded_file")
               echo "✅ MP3 created: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
+            else
+              echo "⚠️ MP3 conversion failed, keeping original" | tee -a "$PROCESS_LOG"
             fi
           fi
           
-          # Convert video to H.264 for wide compatibility
+          # Convert video to H.264 for compatibility
           if [ "$IS_AUDIO" = false ]; then
             codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$downloaded_file" 2>/dev/null || echo "unknown")
             
             if [ "$codec" != "h264" ] && [ "$codec" != "unknown" ]; then
               echo "🎬 Converting to H.264..." | tee -a "$PROCESS_LOG"
               name="${downloaded_file%.*}"
-              ext="${downloaded_file##*.}"
               ffmpeg -i "$downloaded_file" \
                 -c:v libx264 -preset ultrafast -crf 23 \
                 -c:a aac -b:a 128k \
                 -movflags +faststart \
                 -pix_fmt yuv420p \
-                "${name}_temp.mp4" -y 2>/dev/null
+                "${name}_h264.mp4" -y 2>&1 | tail -2
               
-              if [ -s "${name}_temp.mp4" ]; then
+              if [ -s "${name}_h264.mp4" ]; then
                 rm -f "$downloaded_file"
-                mv "${name}_temp.mp4" "${name}.mp4"
+                mv "${name}_h264.mp4" "${name}.mp4"
                 downloaded_file="${name}.mp4"
                 size=$(stat -c%s "$downloaded_file")
-                echo "✅ Converted to H.264: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
+                echo "✅ Converted: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
               fi
             else
-              echo "   Already H.264 or audio only, skipping conversion" | tee -a "$PROCESS_LOG"
-              # Fix extension if needed
+              echo "   Already compatible format" | tee -a "$PROCESS_LOG"
+              # Fix extension if MKV/WebM
               if [[ "$downloaded_file" == *.mkv ]] || [[ "$downloaded_file" == *.webm ]]; then
                 name="${downloaded_file%.*}"
                 ffmpeg -i "$downloaded_file" -c copy "${name}.mp4" -y 2>/dev/null
                 if [ -s "${name}.mp4" ]; then
                   rm -f "$downloaded_file"
                   downloaded_file="${name}.mp4"
-                  echo "   Remuxed to MP4 container" | tee -a "$PROCESS_LOG"
+                  echo "   Remuxed to MP4" | tee -a "$PROCESS_LOG"
                 fi
               fi
             fi
           fi
           
-          # Step 2: Pack as ZIP (ALWAYS - for consistency and splitting)
+          # Step 2: Pack as ZIP
           echo "📦 Creating ZIP archive..." | tee -a "$PROCESS_LOG"
           base="${downloaded_file%.*}"
           ext="${downloaded_file##*.}"
@@ -269,7 +279,7 @@ jobs:
               mv "$downloaded_file" "$ZIP_NAME"
               filename="$ZIP_NAME"
             fi
-            echo "   File is already a ZIP" | tee -a "$PROCESS_LOG"
+            echo "   Already ZIP" | tee -a "$PROCESS_LOG"
           else
             if [ -n "$PASSWORD" ]; then
               zip -P "$PASSWORD" "$ZIP_NAME" "$downloaded_file" 2>/dev/null
@@ -281,7 +291,7 @@ jobs:
               rm -f "$downloaded_file"
               filename="$ZIP_NAME"
               size=$(stat -c%s "$filename")
-              echo "   ZIP created: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
+              echo "   ZIP: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
             else
               mv "$ZIP_NAME" "$downloaded_file" 2>/dev/null
               filename="$downloaded_file"
@@ -289,14 +299,13 @@ jobs:
             fi
           fi
           
-          # Step 3: Split if > 90MB (EXACTLY like Download Manager)
+          # Step 3: Split if > 90MB
           if [ "$size" -gt 94371840 ]; then
-            echo "✂️  Splitting into 90MB parts..." | tee -a "$PROCESS_LOG"
+            echo "✂️  Splitting (90MB parts)..." | tee -a "$PROCESS_LOG"
             
             PARTS_DIR="${base}_parts"
             mkdir -p "$PARTS_DIR"
             
-            # Move zip to parts dir and split
             mv "$filename" "$PARTS_DIR/"
             cd "$PARTS_DIR"
             
@@ -305,61 +314,37 @@ jobs:
             if [ $? -eq 0 ]; then
               rm "$filename"
               
-              # Rename parts
               n=1
               for part in part_*; do
                 new_name=$(printf "${base}.zip.%03d" $n)
                 mv "$part" "$new_name"
-                echo "   - $new_name ($(ls -lh "$new_name" | awk '{print $5}'))" | tee -a "$PROCESS_LOG"
+                echo "   - $new_name" | tee -a "$PROCESS_LOG"
                 n=$((n + 1))
               done
               total=$((n - 1))
               
               echo "   Split into ${total} parts" | tee -a "$PROCESS_LOG"
               
-              # Create Join Scripts
-              # Linux/Mac/Android (Termux)
+              # Join Scripts
               echo "#!/bin/bash" > join.sh
               echo "cat ${base}.zip.* > ../${base}.zip" >> join.sh
               echo "echo 'Joined: ${base}.zip'" >> join.sh
               chmod +x join.sh
               
-              # Windows
               echo "@echo off" > join.bat
               echo "copy /b ${base}.zip.* ..\\${base}.zip" >> join.bat
               echo "echo Joined: ${base}.zip" >> join.bat
               
               # README
-              echo "# 📦 Split ZIP Archive" > README.md
+              echo "# 📦 Split Archive" > README.md
               echo "" >> README.md
-              echo "**Original File:** ${base}.zip" >> README.md
               echo "**Parts:** ${total}" >> README.md
-              if [ -n "$PASSWORD" ]; then
-                echo "**Password:** Yes (set by user)" >> README.md
-              fi
+              [ -n "$PASSWORD" ] && echo "**Password:** Yes" >> README.md
               echo "" >> README.md
-              echo "## 🔧 How to Join & Extract" >> README.md
-              echo "" >> README.md
-              echo "### 🖥️ Windows" >> README.md
-              echo "1. Run \`join.bat\`" >> README.md
-              echo "2. Extract the resulting \`${base}.zip\`" >> README.md
-              echo "" >> README.md
-              echo "### 🍎 Mac / 🐧 Linux" >> README.md
-              echo "Run in terminal:" >> README.md
-              echo "\`\`\`bash" >> README.md
-              echo "bash join.sh" >> README.md
-              if [ -n "$PASSWORD" ]; then
-                echo "unzip -P 'YOUR_PASSWORD' ${base}.zip" >> README.md
-              else
-                echo "unzip ${base}.zip" >> README.md
-              fi
-              echo "\`\`\`" >> README.md
-              echo "" >> README.md
-              echo "### 📱 Android" >> README.md
-              echo "1. Install **Termux**" >> README.md
-              echo "2. Navigate to this folder" >> README.md
-              echo "3. Run: \`cat ${base}.zip.* > ${base}.zip\`" >> README.md
-              echo "4. Open with **ZArchiver**" >> README.md
+              echo "## How to Join" >> README.md
+              echo "**Windows:** Run \`join.bat\`" >> README.md
+              echo "**Mac/Linux:** Run \`bash join.sh\`" >> README.md
+              echo "**Android:** Use Termux: \`cat ${base}.zip.* > ${base}.zip\`" >> README.md
             else
               echo "❌ Split failed" | tee -a "$PROCESS_LOG"
               mv "$filename" ../
@@ -368,7 +353,7 @@ jobs:
             cd ..
           fi
           
-          echo "✅ Completed: ${base}" | tee -a "$PROCESS_LOG"
+          echo "✅ Completed!" | tee -a "$PROCESS_LOG"
           echo "" >> "$PROCESS_LOG"
           
           cd ..
@@ -376,10 +361,9 @@ jobs:
           # Main README
           echo "# 📥 Downloaded Files" > downloads/README.md
           echo "" >> downloads/README.md
-          echo "Date: $(date)" >> downloads/README.md
+          echo "**Date:** $(date)" >> downloads/README.md
           echo "" >> downloads/README.md
-          echo "## Files" >> downloads/README.md
-          echo "" >> downloads/README.md
+          echo "## Contents" >> downloads/README.md
           find downloads -type f \( -name "*.zip" -o -name "*.zip.*" -o -name "*.mp3" -o -name "*.mp4" \) -exec ls -lh {} \; >> downloads/README.md 2>/dev/null
 
       - name: Stop WARP
