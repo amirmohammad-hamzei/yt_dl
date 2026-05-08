@@ -71,11 +71,9 @@ jobs:
         run: |
           echo "Installing ALL required tools..."
           sudo apt-get update -qq
-          # 👇 نصب ffmpeg که قبلاً فراموش شده بود
           sudo apt-get install -y -qq aria2 zip unzip p7zip-full python3-pip ffmpeg
           pip3 install -q yt-dlp
           
-          # Verify installations
           echo "✅ Tools ready!"
           echo "yt-dlp: $(yt-dlp --version 2>/dev/null || echo 'FAILED')"
           echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 || echo 'FAILED')"
@@ -214,7 +212,6 @@ jobs:
             echo "🎵 Converting to MP3 320kbps..." | tee -a "$PROCESS_LOG"
             name="${downloaded_file%.*}"
             
-            # 👇 چک کردن اینکه ffmpeg واقعاً هست
             if ! command -v ffmpeg &> /dev/null; then
               echo "❌ ffmpeg not found! Installing..."
               sudo apt-get install -y -qq ffmpeg
@@ -268,19 +265,16 @@ jobs:
             fi
           fi
           
-          # Step 2: Pack as ZIP
-          echo "📦 Creating ZIP archive..." | tee -a "$PROCESS_LOG"
+          # 👇 NEW: Smart ZIP - Only ZIP if > 90MB, otherwise keep original
+          echo "📦 Processing file..." | tee -a "$PROCESS_LOG"
           base="${downloaded_file%.*}"
           ext="${downloaded_file##*.}"
-          ZIP_NAME="${base}.zip"
           
-          if [ "$ext" = "zip" ] || [ "$ext" = "ZIP" ]; then
-            if [ "$downloaded_file" != "$ZIP_NAME" ]; then
-              mv "$downloaded_file" "$ZIP_NAME"
-              filename="$ZIP_NAME"
-            fi
-            echo "   Already ZIP" | tee -a "$PROCESS_LOG"
-          else
+          if [ "$size" -gt 94371840 ]; then
+            # File > 90MB: ZIP it
+            echo "   File > 90MB, creating ZIP..." | tee -a "$PROCESS_LOG"
+            ZIP_NAME="${base}.zip"
+            
             if [ -n "$PASSWORD" ]; then
               zip -P "$PASSWORD" "$ZIP_NAME" "$downloaded_file" 2>/dev/null
             else
@@ -297,10 +291,8 @@ jobs:
               filename="$downloaded_file"
               echo "   ZIP failed, keeping original" | tee -a "$PROCESS_LOG"
             fi
-          fi
-          
-          # Step 3: Split if > 90MB
-          if [ "$size" -gt 94371840 ]; then
+            
+            # Split the ZIP
             echo "✂️  Splitting (90MB parts)..." | tee -a "$PROCESS_LOG"
             
             PARTS_DIR="${base}_parts"
@@ -351,6 +343,10 @@ jobs:
             fi
             
             cd ..
+          else
+            # File <= 90MB: Keep original, no ZIP
+            echo "   File <= 90MB, keeping original format (no ZIP)" | tee -a "$PROCESS_LOG"
+            filename="$downloaded_file"
           fi
           
           echo "✅ Completed!" | tee -a "$PROCESS_LOG"
