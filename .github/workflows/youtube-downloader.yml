@@ -1,4 +1,4 @@
-name: 🎬 YouTube Downloader Pro v3
+name: 🎬 YouTube Downloader Pro v4
 
 on:
   workflow_dispatch:
@@ -19,6 +19,10 @@ on:
           - audio
       password:
         description: 'رمز فایل ZIP (اختیاری - خالی بذارید بدون رمز باشه)'
+        required: false
+        default: ''
+      batch_id:
+        description: 'شناسه یکتای batch (اختیاری - برای پنل وب)'
         required: false
         default: ''
 
@@ -83,17 +87,23 @@ jobs:
           YT_URL: ${{ github.event.inputs.url }}
           QUALITY: ${{ github.event.inputs.quality }}
           PASSWORD: ${{ github.event.inputs.password }}
+          BATCH_ID: ${{ github.event.inputs.batch_id }}
         run: |
-          # Create unique folder with timestamp - NO MORE DELETING OLD FILES
-          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          # Use provided batch_id or generate timestamp-based one
+          if [ -n "$BATCH_ID" ]; then
+            BATCH_FOLDER="$BATCH_ID"
+          else
+            TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+            BATCH_FOLDER="yt_${TIMESTAMP}"
+          fi
           
           mkdir -p downloads
-          mkdir -p "downloads/yt_${TIMESTAMP}"
-          cd "downloads/yt_${TIMESTAMP}"
+          mkdir -p "downloads/${BATCH_FOLDER}"
+          cd "downloads/${BATCH_FOLDER}"
           
-          PROCESS_LOG="../../process_${TIMESTAMP}.log"
+          PROCESS_LOG="../../process_${BATCH_FOLDER}.log"
           echo "Download started: $(date)" > "$PROCESS_LOG"
-          echo "Batch: yt_${TIMESTAMP}" >> "$PROCESS_LOG"
+          echo "Batch: ${BATCH_FOLDER}" >> "$PROCESS_LOG"
           
           URL="$YT_URL"
           QUALITY="$QUALITY"
@@ -106,7 +116,7 @@ jobs:
           echo "========================================" | tee -a "$PROCESS_LOG"
           echo "URL: $URL" | tee -a "$PROCESS_LOG"
           echo "Quality: $QUALITY" | tee -a "$PROCESS_LOG"
-          echo "Batch: yt_${TIMESTAMP}" | tee -a "$PROCESS_LOG"
+          echo "Batch: ${BATCH_FOLDER}" | tee -a "$PROCESS_LOG"
           echo "" | tee -a "$PROCESS_LOG"
           
           # Quality format selection
@@ -338,14 +348,11 @@ jobs:
           echo "" >> downloads/README.md
           echo "## 📂 Download History" >> downloads/README.md
           echo "" >> downloads/README.md
-          for folder in downloads/yt_*; do
-            if [ -d "$folder" ]; then
-              folder_name=$(basename "$folder")
-              # Extract date from folder name
-              folder_date=$(echo "$folder_name" | sed 's/yt_//' | sed 's/_/ /g' | sed 's/-/:/3g')
-              file_count=$(find "$folder" -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" | wc -l)
-              echo "- **[${folder_name}](${folder_name}/)** - ${file_count} files - ${folder_date}" >> downloads/README.md
-            fi
+          for folder in downloads/yt_* downloads/yt_*_* 2>/dev/null; do
+            [ -d "$folder" ] || continue
+            folder_name=$(basename "$folder")
+            file_count=$(find "$folder" -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" | wc -l)
+            echo "- **[${folder_name}](${folder_name}/)** - ${file_count} files" >> downloads/README.md
           done
           
           cd ..
@@ -363,10 +370,6 @@ jobs:
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          echo ""
-          echo "Files to push:"
-          find downloads -type f -exec ls -lh {} \;
           
           git add downloads/
           
@@ -386,28 +389,19 @@ jobs:
           echo " ✅ UPLOAD COMPLETE!"
           echo "=============================="
           echo ""
-          echo "📁 Download your files from:"
+          echo "📁 Download from:"
           echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
-          echo ""
 
       - name: Show Results
         run: |
           echo ""
           echo "=============================="
-          echo " 📥 YOUR DOWNLOAD LINK"
+          echo " 📥 DOWNLOAD LINK"
           echo "=============================="
           echo ""
-          echo "🔗 All downloads:"
-          echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+          echo "🔗 ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
           echo ""
-          
-          LATEST=$(ls -td downloads/yt_* 2>/dev/null | head -1)
+          LATEST=$(ls -td downloads/yt_* downloads/yt_*_* 2>/dev/null | head -1)
           if [ -n "$LATEST" ]; then
-            echo "🆕 Latest batch:"
-            echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${LATEST}"
-            echo ""
-            echo "📁 Files:"
-            find "$LATEST" -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" -exec ls -lh {} \; 2>/dev/null
+            echo "🆕 Latest: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${LATEST}"
           fi
-          echo ""
-          echo "📋 Copy the link and open in browser to download!"
