@@ -339,7 +339,7 @@ jobs:
           echo "" >> README.md
           find . -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" -exec ls -lh {} \; >> README.md 2>/dev/null
           
-          # Update main downloads README - FIXED SYNTAX
+          # Update main downloads README
           cd ../..
           
           echo "# 📥 All YouTube Downloads" > downloads/README.md
@@ -349,7 +349,6 @@ jobs:
           echo "## 📂 Download History" >> downloads/README.md
           echo "" >> downloads/README.md
           
-          # Fixed: separate loops instead of brace expansion
           for folder in downloads/yt_*; do
             [ -d "$folder" ] || continue
             folder_name=$(basename "$folder")
@@ -383,8 +382,12 @@ jobs:
           git commit -m "📥 YouTube Download $(date +%Y-%m-%d_%H-%M-%S) [skip ci]"
           
           echo "🚀 Pushing..."
-          git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || true
-          git push origin HEAD:${{ github.ref_name }}
+          # Try pull first, if fails use force-with-lease
+          git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || \
+            git push origin HEAD:${{ github.ref_name }} --force-with-lease
+          
+          # If push without force worked from pull, do normal push
+          git push origin HEAD:${{ github.ref_name }} 2>/dev/null || true
           
           echo ""
           echo "=============================="
@@ -403,7 +406,6 @@ jobs:
           echo ""
           echo "🔗 ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
           echo ""
-          # Fixed: show latest folder properly
           LATEST=$(ls -td downloads/yt_* 2>/dev/null | head -1)
           if [ -n "$LATEST" ]; then
             echo "🆕 Latest: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${LATEST}"
