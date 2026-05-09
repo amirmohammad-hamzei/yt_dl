@@ -1,4 +1,4 @@
-name: 🎬 YouTube Downloader Pro v6
+name: 🎬 YouTube Downloader Pro v7
 
 on:
   workflow_dispatch:
@@ -73,11 +73,9 @@ jobs:
 
       - name: Install Tools
         run: |
-          echo "Installing ALL required tools..."
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 zip unzip p7zip-full python3-pip ffmpeg
           pip3 install -q yt-dlp
-          
           echo "✅ Tools ready!"
 
       - name: Download & Process YouTube Video
@@ -117,23 +115,21 @@ jobs:
           esac
           
           try_download() {
-            local method="$1" client="$2" use_proxy="${3:-true}"
-            echo "▶ Method $method (client: $client, proxy: $use_proxy)..."
+            local use_proxy="${1:-true}"
+            local client="$2"
+            
+            echo "▶ Downloading (proxy:$use_proxy, client:$client)..."
             
             [ "$use_proxy" = true ] && PROXY_ARG="--proxy $PROXY" || PROXY_ARG=""
             [ "$client" != "default" ] && CLIENT_ARG="--extractor-args youtube:player_client=$client" || CLIENT_ARG=""
             
-            if [ "$IS_AUDIO" = true ]; then
-              yt-dlp $PROXY_ARG -f "$FMT" -o "%(title)s.%(ext)s" --no-playlist \
-                --retries 10 --fragment-retries 10 --no-check-certificates \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                $CLIENT_ARG "$URL" 2>&1 | tail -3
-            else
-              yt-dlp $PROXY_ARG -f "$FMT" --merge-output-format mp4 -o "%(title)s.%(ext)s" \
-                --no-playlist --retries 10 --fragment-retries 10 --no-check-certificates \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                $CLIENT_ARG "$URL" 2>&1 | tail -3
-            fi
+            yt-dlp $PROXY_ARG -f "$FMT" \
+              $([ "$IS_AUDIO" = false ] && echo "--merge-output-format mp4") \
+              -o "%(title)s.%(ext)s" \
+              --no-playlist --retries 10 --fragment-retries 10 \
+              --no-check-certificates \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              $CLIENT_ARG "$URL" 2>&1 | tail -5
             
             [ "$(ls -A . 2>/dev/null)" ] && return 0 || return 1
           }
@@ -141,11 +137,11 @@ jobs:
           DOWNLOAD_SUCCESS=false
           
           for client in android ios web default; do
-            [ "$DOWNLOAD_SUCCESS" = false ] && try_download "proxy-$client" "$client" true && DOWNLOAD_SUCCESS=true
+            [ "$DOWNLOAD_SUCCESS" = false ] && try_download true "$client" && DOWNLOAD_SUCCESS=true
           done
           
           for client in android ios web default; do
-            [ "$DOWNLOAD_SUCCESS" = false ] && try_download "direct-$client" "$client" false && DOWNLOAD_SUCCESS=true
+            [ "$DOWNLOAD_SUCCESS" = false ] && try_download false "$client" && DOWNLOAD_SUCCESS=true
           done
           
           [ "$DOWNLOAD_SUCCESS" = false ] && echo "❌ FAILED" && exit 1
@@ -154,6 +150,7 @@ jobs:
           size=$(stat -c%s "$downloaded_file")
           echo "✅ Downloaded: $downloaded_file ($((size / 1024 / 1024)) MB)"
           
+          # Audio conversion
           if [ "$IS_AUDIO" = true ]; then
             echo "🎵 Converting to MP3..."
             name="${downloaded_file%.*}"
@@ -162,10 +159,10 @@ jobs:
               rm -f "$downloaded_file"
               downloaded_file="${name}.mp3"
               size=$(stat -c%s "$downloaded_file")
-              echo "✅ MP3: $((size / 1024 / 1024)) MB"
             fi
           fi
           
+          # Video conversion
           if [ "$IS_AUDIO" = false ]; then
             codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$downloaded_file" 2>/dev/null || echo "unknown")
             if [ "$codec" != "h264" ] && [ "$codec" != "unknown" ]; then
@@ -178,26 +175,24 @@ jobs:
                 mv "${name}_h264.mp4" "${name}.mp4"
                 downloaded_file="${name}.mp4"
                 size=$(stat -c%s "$downloaded_file")
-                echo "✅ MP4: $((size / 1024 / 1024)) MB"
               fi
             elif [[ "$downloaded_file" == *.mkv ]] || [[ "$downloaded_file" == *.webm ]]; then
               name="${downloaded_file%.*}"
               ffmpeg -i "$downloaded_file" -c copy "${name}.mp4" -y 2>/dev/null
-              [ -s "${name}.mp4" ] && rm -f "$downloaded_file" && downloaded_file="${name}.mp4"
+              [ -s "${name}.mp4" ] && rm -f "$downloaded_file" && downloaded_file="${name}.mp4" && size=$(stat -c%s "$downloaded_file")
             fi
           fi
           
-          echo "📦 Processing..."
+          # ZIP & Split
           base="${downloaded_file%.*}"
           
           if [ "$size" -gt 94371840 ]; then
-            echo "   File > 90MB, zipping..."
+            echo "📦 Zipping & splitting..."
             ZIP_NAME="${base}.zip"
             [ -n "$PASSWORD" ] && zip -P "$PASSWORD" "$ZIP_NAME" "$downloaded_file" 2>/dev/null || zip "$ZIP_NAME" "$downloaded_file" 2>/dev/null
             
             if [ -s "$ZIP_NAME" ]; then
               rm -f "$downloaded_file"
-              echo "   Splitting..."
               PARTS_DIR="${base}_parts"
               mkdir -p "$PARTS_DIR"
               mv "$ZIP_NAME" "$PARTS_DIR/"
@@ -209,7 +204,6 @@ jobs:
                 mv "$part" "$(printf "${base}.zip.%03d" $n)"
                 n=$((n + 1))
               done
-              echo "   Split into $((n-1)) parts"
               echo "#!/bin/bash" > join.sh
               echo "cat ${base}.zip.* > ../${base}.zip" >> join.sh
               chmod +x join.sh
@@ -218,23 +212,14 @@ jobs:
               cd ..
             fi
           else
-            echo "   File <= 90MB, keeping original"
+            echo "📄 File <= 90MB, keeping original"
           fi
           
-          echo "✅ Completed!"
+          echo "✅ Done!"
           cd ../..
           
-          # Update README
-          echo "# 📥 All YouTube Downloads" > downloads/README.md
-          echo "" >> downloads/README.md
-          echo "**Last update:** $(date)" >> downloads/README.md
-          echo "" >> downloads/README.md
-          for folder in downloads/yt_*; do
-            [ -d "$folder" ] || continue
-            folder_name=$(basename "$folder")
-            file_count=$(find "$folder" -type f -not -name "README.md" | wc -l)
-            echo "- **[${folder_name}](${folder_name}/)** - ${file_count} files" >> downloads/README.md
-          done
+          # Save list of created files
+          find "downloads/${BATCH_FOLDER}" -type f > "../created_files.txt"
           
           cd ..
 
@@ -244,52 +229,44 @@ jobs:
           docker stop warp 2>/dev/null || true
           docker rm warp 2>/dev/null || true
 
-      - name: Finalize & Push
+      - name: Upload via GitHub API (No Conflicts)
         if: always()
         run: |
-          echo "📤 Saving to GitHub..."
+          echo "📤 Uploading files via API..."
           
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add downloads/
-          
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
+          # Get files to upload
+          if [ ! -f created_files.txt ]; then
+            echo "No files to upload."
             exit 0
           fi
           
-          git commit -m "📥 YouTube Download [skip ci]"
+          API_URL="https://api.github.com/repos/${{ github.repository }}/contents"
           
-          echo "🚀 Pushing (with retry)..."
-          
-          # Retry up to 5 times
-          PUSHED=false
-          for i in 1 2 3 4 5; do
-            echo "  Attempt $i/5..."
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            [ "$(basename "$file")" = "README.md" ] && continue
             
-            if git push origin HEAD:${{ github.ref_name }} 2>/dev/null; then
-              echo "✅ Push successful!"
-              PUSHED=true
-              break
-            fi
+            # Encode file to base64
+            CONTENT=$(base64 -w0 "$file")
             
-            if [ $i -lt 5 ]; then
-              echo "  Push conflict, pulling and retrying..."
-              git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || true
-              sleep $((RANDOM % 5 + 1))  # Random delay to avoid collision
-            fi
-          done
-          
-          if [ "$PUSHED" = false ]; then
-            echo "  Normal push failed, using force-with-lease..."
-            git push origin HEAD:${{ github.ref_name }} --force-with-lease
-          fi
+            # API path
+            API_PATH=$(echo "$file" | sed 's/ /%20/g')
+            
+            echo "  Uploading: $file"
+            
+            # Upload via API
+            curl -s -X PUT \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"message\":\"📥 Download [skip ci]\",\"content\":\"$CONTENT\",\"branch\":\"${{ github.ref_name }}\"}" \
+              "$API_URL/$API_PATH" > /dev/null
+            
+            echo "    ✅ Done!"
+            
+          done < created_files.txt
           
           echo ""
-          echo "=============================="
-          echo " ✅ UPLOAD COMPLETE!"
-          echo "=============================="
+          echo "✅ All files uploaded!"
           echo ""
           echo "📁 Download from:"
           echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
@@ -302,8 +279,3 @@ jobs:
           echo "=============================="
           echo ""
           echo "🔗 ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
-          echo ""
-          LATEST=$(ls -td downloads/yt_* 2>/dev/null | head -1)
-          if [ -n "$LATEST" ]; then
-            echo "🆕 Latest: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${LATEST}"
-          fi
