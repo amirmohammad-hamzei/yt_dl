@@ -1,407 +1,319 @@
-name: 🎬 YouTube Downloader Pro v4
+name: "01- 🎬 YouTube Downloader (Artifact Mode)"
 
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: 'YouTube Video URL'
+      youtube_urls:
+        description: "🔗 YouTube video URLs — separate with spaces"
         required: true
-      quality:
-        description: 'Quality'
+        type: string
+      download_subtitles:
+        description: "📝 Download subtitles (English & Persian)"
         required: false
-        default: 'best'
+        default: false
+        type: boolean
+      quality:
+        description: "🎬 Video quality"
+        required: false
+        default: "best"
         type: choice
         options:
           - best
+          - 2160
+          - 1440
           - 1080
           - 720
           - 480
           - audio
       password:
-        description: 'رمز فایل ZIP (اختیاری - خالی بذارید بدون رمز باشه)'
+        description: "🔒 Password for zip file (optional)"
         required: false
-        default: ''
-      batch_id:
-        description: 'شناسه یکتای batch (اختیاری - برای پنل وب)'
-        required: false
-        default: ''
+        default: ""
+        type: string
 
 jobs:
-  download:
+  download-youtube:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 180
     permissions:
-      contents: write
-    
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      contents: read # دیگه نیازی به نوشتن روی مخزن نداریم (پوش نمی‌کنیم)
 
-      - name: Start WARP
+    steps:
+      # دیگه checkout لازم نیست، چون قرار نیست چیزی پوش کنیم
+
+      - name: "⚙️ Configure Git"
         run: |
-          echo "Starting WARP VPN..."
-          
-          if ! command -v docker &> /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq docker.io
-            sudo systemctl start docker
-          fi
-          
-          docker rm -f warp 2>/dev/null || true
-          
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          echo "Git configured."
+
+      - name: "🌐 Start WARP Container (Proxy)"
+        run: |
+          echo "Starting Cloudflare WARP..."
+          docker network create warp-net || true
           docker run -d \
             --name warp \
+            --restart=always \
+            --network warp-net \
             -p 1080:1080 \
             --cap-add NET_ADMIN \
             --sysctl net.ipv6.conf.all.disable_ipv6=0 \
             --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
             caomingjun/warp
-          
-          echo "Waiting for WARP to connect..."
-          sleep 10
-          
-          for i in $(seq 1 20); do
-            if curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp"; then
-              echo "✅ WARP connected!"
-              exit 0
+
+          echo "Waiting for WARP to initialize..."
+          sleep 15
+
+          for i in {1..5}; do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              break
+            else
+              echo "Attempt $i/5 - waiting..."
+              sleep 5
             fi
-            echo "  Attempt $i/20..."
-            sleep 5
           done
-          
-          echo "⚠️ WARP might not be fully ready, continuing anyway..."
 
-      - name: Install Tools
+      - name: "📦 Install Dependencies"
         run: |
-          echo "Installing ALL required tools..."
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 zip unzip p7zip-full python3-pip ffmpeg
-          pip3 install -q yt-dlp
-          
-          echo "✅ Tools ready!"
-          echo "yt-dlp: $(yt-dlp --version 2>/dev/null || echo 'FAILED')"
-          echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 || echo 'FAILED')"
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip p7zip-full curl jq bc unzip
 
-      - name: Download & Process YouTube Video
+          # Install Deno (for YouTube JS challenge solving)
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+
+          pip3 install --upgrade yt-dlp
+
+      - name: "🎯 Download, Process & Package"
         env:
-          YT_URL: ${{ github.event.inputs.url }}
-          QUALITY: ${{ github.event.inputs.quality }}
-          PASSWORD: ${{ github.event.inputs.password }}
-          BATCH_ID: ${{ github.event.inputs.batch_id }}
+          YT_URLS: ${{ github.event.inputs.youtube_urls }}
+          YT_QUALITY: ${{ github.event.inputs.quality }}
+          YT_PASSWORD: ${{ github.event.inputs.password }}
+          DOWNLOAD_SUBS: ${{ github.event.inputs.download_subtitles }}
         run: |
-          # Use provided batch_id or generate timestamp-based one
-          if [ -n "$BATCH_ID" ]; then
-            BATCH_FOLDER="$BATCH_ID"
-          else
-            TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-            BATCH_FOLDER="yt_${TIMESTAMP}"
-          fi
-          
-          mkdir -p downloads
-          mkdir -p "downloads/${BATCH_FOLDER}"
-          cd "downloads/${BATCH_FOLDER}"
-          
-          PROCESS_LOG="../../process_${BATCH_FOLDER}.log"
-          echo "Download started: $(date)" > "$PROCESS_LOG"
-          echo "Batch: ${BATCH_FOLDER}" >> "$PROCESS_LOG"
-          
-          URL="$YT_URL"
-          QUALITY="$QUALITY"
-          PASSWORD="$PASSWORD"
-          
-          PROXY="socks5://127.0.0.1:1080"
-          
-          echo "========================================" | tee -a "$PROCESS_LOG"
-          echo "  YouTube Downloader (WARP)" | tee -a "$PROCESS_LOG"
-          echo "========================================" | tee -a "$PROCESS_LOG"
-          echo "URL: $URL" | tee -a "$PROCESS_LOG"
-          echo "Quality: $QUALITY" | tee -a "$PROCESS_LOG"
-          echo "Batch: ${BATCH_FOLDER}" | tee -a "$PROCESS_LOG"
-          echo "" | tee -a "$PROCESS_LOG"
-          
-          # Quality format selection
+          # ─────────────────────────────────────────────────────────
+          # AVASAM YouTube Downloader - Artifact Mode
+          # https://avasam.ir
+          # ─────────────────────────────────────────────────────────
+
+          set -e # Exit on first error
+
+          URLS_RAW="${YT_URLS}"
+          read -ra URL_LIST <<< "$URLS_RAW"
+          TOTAL_URLS=${#URL_LIST[@]}
+
+          QUALITY="${YT_QUALITY}"
+          ZIP_PASSWORD="${YT_PASSWORD}"
+          SPLIT_MB=45  # برای قطعه‌قطعه کردن فایل‌های حجیم (فقط برای نمایش داخل زیپ) - آرتیفکت خودش سایز نامحدود داره
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          # دایرکتوری اصلی برای بسته‌بندی نهایی
+          BASE_DIR="/home/runner/artifact_packages"
+          mkdir -p "$BASE_DIR"
+
+          echo "============================================="
+          echo " AVASAM YouTube Downloader - Artifact Mode"
+          echo "============================================="
+          echo " URL Count: $TOTAL_URLS"
+          echo " Quality: $QUALITY"
+          echo " Subtitles: ${DOWNLOAD_SUBS}"
+          echo " Password: ${ZIP_PASSWORD:-None}"
+          echo " MANDEGARI: 1 days"
+          echo "============================================="
+          echo ""
+
+          # ─────────── توابع کمکی ───────────
+          sanitize_name() {
+            echo "$1" | sed 's/ /-/g' | sed 's/　/-/g' | tr -s '-'
+          }
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          # ─────────── تنظیم فرمت بر اساس کیفیت ───────────
           case "$QUALITY" in
-            audio)
-              FMT="bestaudio[ext=m4a]/bestaudio/best"
-              IS_AUDIO=true
+            "audio")
+              FORMAT="bestaudio/bestaudio*"
               ;;
-            1080)
-              FMT="bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-              IS_AUDIO=false
+            "best")
+              FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best"
               ;;
-            720)
-              FMT="bestvideo[height<=720]+bestaudio/best[height<=720]"
-              IS_AUDIO=false
+            "2160"|"4k")
+              FORMAT="bestvideo[height=2160]+bestaudio/bestvideo[height<=2160]+bestaudio/bestvideo[height=2160]*+bestaudio*/bestvideo[height<=2160]*+bestaudio*"
               ;;
-            480)
-              FMT="bestvideo[height<=480]+bestaudio/best[height<=480]"
-              IS_AUDIO=false
+            "1440"|"2k")
+              FORMAT="bestvideo[height=1440]+bestaudio/bestvideo[height<=1440]+bestaudio/bestvideo[height=1440]*+bestaudio*/bestvideo[height<=1440]*+bestaudio*"
+              ;;
+            "1080")
+              FORMAT="bestvideo[height=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/bestvideo[height=1080]*+bestaudio*/bestvideo[height<=1080]*+bestaudio*"
+              ;;
+            "720")
+              FORMAT="bestvideo[height=720]+bestaudio/bestvideo[height<=720]+bestaudio/bestvideo[height=720]*+bestaudio*/bestvideo[height<=720]*+bestaudio*"
+              ;;
+            "480")
+              FORMAT="bestvideo[height=480]+bestaudio/bestvideo[height<=480]+bestaudio/bestvideo[height=480]*+bestaudio*/bestvideo[height<=480]*+bestaudio*"
               ;;
             *)
-              FMT="bestvideo+bestaudio/best"
-              IS_AUDIO=false
+              FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best"
               ;;
           esac
-          
-          # Download function
-          try_download() {
-            local method="$1"
-            local client="$2"
-            local use_proxy="${3:-true}"
-            
-            echo "▶ Method $method (client: $client, proxy: $use_proxy)..." | tee -a "$PROCESS_LOG"
-            
-            if [ "$use_proxy" = true ]; then
-              PROXY_ARG="--proxy $PROXY"
+
+          # ─────────── تابع اصلی دانلود (همان ۸ متد قبلی) ───────────
+          download_video() {
+            local METHOD=$1
+            local URL=$2
+            local TMP_DIR=$3
+            echo "  → Trying method $METHOD..."
+
+            if [ "$QUALITY" = "audio" ]; then
+              COMMON_FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+            elif [ "$QUALITY" = "best" ]; then
+              COMMON_FLAGS="--merge-output-format mp4 --format-sort res,+codec:vp9.1,+size --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
             else
-              PROXY_ARG=""
+              COMMON_FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
             fi
-            
-            if [ "$client" != "default" ]; then
-              CLIENT_ARG="--extractor-args youtube:player_client=$client"
-            else
-              CLIENT_ARG=""
-            fi
-            
-            if [ "$IS_AUDIO" = true ]; then
-              yt-dlp $PROXY_ARG \
-                -f "$FMT" \
-                -o "%(title)s.%(ext)s" \
-                --no-playlist \
-                --retries 10 \
-                --fragment-retries 10 \
-                --no-check-certificates \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                $CLIENT_ARG \
-                "$URL" 2>&1 | tail -3
-            else
-              yt-dlp $PROXY_ARG \
-                -f "$FMT" \
-                --merge-output-format mp4 \
-                -o "%(title)s.%(ext)s" \
-                --no-playlist \
-                --retries 10 \
-                --fragment-retries 10 \
-                --no-check-certificates \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                $CLIENT_ARG \
-                "$URL" 2>&1 | tail -3
-            fi
-            
-            [ "$(ls -A . 2>/dev/null)" ] && return 0 || return 1
+
+            case $METHOD in
+              1)
+                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$URL" ;;
+              2)
+                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$URL" ;;
+              3)
+                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL" ;;
+              4)
+                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL" ;;
+              5)
+                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android_vr" "$URL" ;;
+              6)
+                yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" ;;
+              7)
+                yt-dlp --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=mweb" "$URL" ;;
+              8)
+                yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36" "$URL" ;;
+            esac
           }
-          
-          # Try all combinations
-          DOWNLOAD_SUCCESS=false
-          
-          for client in android ios web default; do
-            if [ "$DOWNLOAD_SUCCESS" = false ]; then
-              try_download "proxy-$client" "$client" true && DOWNLOAD_SUCCESS=true
-            fi
-          done
-          
-          for client in android ios web default; do
-            if [ "$DOWNLOAD_SUCCESS" = false ]; then
-              try_download "direct-$client" "$client" false && DOWNLOAD_SUCCESS=true
-            fi
-          done
-          
-          if [ "$DOWNLOAD_SUCCESS" = false ] || [ ! "$(ls -A . 2>/dev/null)" ]; then
-            echo "❌ FAILED: Could not download video" | tee -a "$PROCESS_LOG"
-            exit 1
-          fi
-          
-          # Get downloaded file
-          downloaded_file=$(ls -t | head -1)
-          size=$(stat -c%s "$downloaded_file")
-          echo "✅ Downloaded: $downloaded_file ($((size / 1024 / 1024)) MB)" | tee -a "$PROCESS_LOG"
-          
-          # Convert audio to MP3
-          if [ "$IS_AUDIO" = true ]; then
-            echo "🎵 Converting to MP3 320kbps..." | tee -a "$PROCESS_LOG"
-            name="${downloaded_file%.*}"
-            
-            ffmpeg -i "$downloaded_file" -vn -codec:a libmp3lame -b:a 320k -ar 44100 -ac 2 "${name}.mp3" -y 2>/dev/null
-            
-            if [ -s "${name}.mp3" ]; then
-              rm -f "$downloaded_file"
-              downloaded_file="${name}.mp3"
-              size=$(stat -c%s "$downloaded_file")
-              echo "✅ MP3 created: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
-            fi
-          fi
-          
-          # Convert video to H.264
-          if [ "$IS_AUDIO" = false ]; then
-            codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$downloaded_file" 2>/dev/null || echo "unknown")
-            
-            if [ "$codec" != "h264" ] && [ "$codec" != "unknown" ]; then
-              echo "🎬 Converting to H.264..." | tee -a "$PROCESS_LOG"
-              name="${downloaded_file%.*}"
-              ffmpeg -i "$downloaded_file" \
-                -c:v libx264 -preset ultrafast -crf 23 \
-                -c:a aac -b:a 128k \
-                -movflags +faststart \
-                -pix_fmt yuv420p \
-                "${name}_h264.mp4" -y 2>/dev/null
-              
-              if [ -s "${name}_h264.mp4" ]; then
-                rm -f "$downloaded_file"
-                mv "${name}_h264.mp4" "${name}.mp4"
-                downloaded_file="${name}.mp4"
-                size=$(stat -c%s "$downloaded_file")
-                echo "✅ Converted: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
-              fi
-            else
-              if [[ "$downloaded_file" == *.mkv ]] || [[ "$downloaded_file" == *.webm ]]; then
-                name="${downloaded_file%.*}"
-                ffmpeg -i "$downloaded_file" -c copy "${name}.mp4" -y 2>/dev/null
-                if [ -s "${name}.mp4" ]; then
-                  rm -f "$downloaded_file"
-                  downloaded_file="${name}.mp4"
-                fi
-              fi
-            fi
-          fi
-          
-          # Smart ZIP logic - Only ZIP if > 90MB
-          echo "📦 Processing file..." | tee -a "$PROCESS_LOG"
-          base="${downloaded_file%.*}"
-          
-          if [ "$size" -gt 94371840 ]; then
-            echo "   File > 90MB, creating ZIP..." | tee -a "$PROCESS_LOG"
-            ZIP_NAME="${base}.zip"
-            
-            if [ -n "$PASSWORD" ]; then
-              zip -P "$PASSWORD" "$ZIP_NAME" "$downloaded_file" 2>/dev/null
-            else
-              zip "$ZIP_NAME" "$downloaded_file" 2>/dev/null
-            fi
-            
-            if [ -s "$ZIP_NAME" ]; then
-              rm -f "$downloaded_file"
-              size=$(stat -c%s "$ZIP_NAME")
-              echo "   ZIP: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
-              
-              echo "✂️  Splitting (90MB parts)..." | tee -a "$PROCESS_LOG"
-              PARTS_DIR="${base}_parts"
-              mkdir -p "$PARTS_DIR"
-              mv "$ZIP_NAME" "$PARTS_DIR/"
-              cd "$PARTS_DIR"
-              
-              split -b 90M -d "$ZIP_NAME" "part_"
-              
-              if [ $? -eq 0 ]; then
-                rm "$ZIP_NAME"
-                n=1
-                for part in part_*; do
-                  new_name=$(printf "${base}.zip.%03d" $n)
-                  mv "$part" "$new_name"
-                  n=$((n + 1))
-                done
-                total=$((n - 1))
-                echo "   Split into ${total} parts" | tee -a "$PROCESS_LOG"
-                
-                echo "#!/bin/bash" > join.sh
-                echo "cat ${base}.zip.* > ../${base}.zip" >> join.sh
-                chmod +x join.sh
-                
-                echo "@echo off" > join.bat
-                echo "copy /b ${base}.zip.* ..\\${base}.zip" >> join.bat
-                
-                echo "# 📦 Split Archive" > README.md
-                echo "" >> README.md
-                echo "**Parts:** ${total}" >> README.md
-                [ -n "$PASSWORD" ] && echo "**Password:** Yes" >> README.md
-                echo "" >> README.md
-                echo "## How to Join" >> README.md
-                echo "- **Windows:** Run \`join.bat\`" >> README.md
-                echo "- **Mac/Linux:** Run \`bash join.sh\`" >> README.md
-                echo "- **Android:** \`cat ${base}.zip.* > ${base}.zip\`" >> README.md
-              fi
-              cd ..
-            fi
-          else
-            echo "   File <= 90MB, keeping original format" | tee -a "$PROCESS_LOG"
-          fi
-          
-          echo "✅ Completed!" | tee -a "$PROCESS_LOG"
-          
-          # Batch README
-          echo "# 📥 YouTube Download" > README.md
-          echo "" >> README.md
-          echo "**Date:** $(date)" >> README.md
-          echo "**URL:** $URL" >> README.md
-          echo "**Quality:** $QUALITY" >> README.md
-          [ -n "$PASSWORD" ] && echo "**Password:** Yes" >> README.md
-          echo "" >> README.md
-          echo "## Files" >> README.md
-          echo "" >> README.md
-          find . -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" -exec ls -lh {} \; >> README.md 2>/dev/null
-          
-          # Update main downloads README
-          cd ../..
-          
-          echo "# 📥 All YouTube Downloads" > downloads/README.md
-          echo "" >> downloads/README.md
-          echo "**Last update:** $(date)" >> downloads/README.md
-          echo "" >> downloads/README.md
-          echo "## 📂 Download History" >> downloads/README.md
-          echo "" >> downloads/README.md
-          for folder in downloads/yt_* downloads/yt_*_* 2>/dev/null; do
-            [ -d "$folder" ] || continue
-            folder_name=$(basename "$folder")
-            file_count=$(find "$folder" -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" | wc -l)
-            echo "- **[${folder_name}](${folder_name}/)** - ${file_count} files" >> downloads/README.md
-          done
-          
-          cd ..
 
-      - name: Stop WARP
+          # ─────────── پردازش هر لینک ───────────
+          URL_INDEX=0
+          for URL in "${URL_LIST[@]}"; do
+            URL_INDEX=$((URL_INDEX + 1))
+            echo "============================================================"
+            echo " Processing URL $URL_INDEX / $TOTAL_URLS : $URL"
+            echo "============================================================"
+
+            # تبدیل لینک‌های کوتاه
+            if [[ "$URL" =~ youtu\.be/([a-zA-Z0-9_-]+) ]]; then
+              VIDEO_ID="${BASH_REMATCH[1]}"
+              VIDEO_ID="${VIDEO_ID%%\?*}"
+              URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
+              echo " Normalized URL: $URL"
+            fi
+
+            TMP_DIR="tmp_downloads_${URL_INDEX}"
+            mkdir -p "$TMP_DIR"
+
+            # دانلود با اولویت‌بندی متدها
+            DOWNLOAD_SUCCESS=false
+            for METHOD in 1 2 3 4 5 6 7 8; do
+              if download_video $METHOD "$URL" "$TMP_DIR"; then
+                echo "  ✅ Success with method $METHOD!"
+                DOWNLOAD_SUCCESS=true
+                break
+              else
+                echo "  ❌ Method $METHOD failed."
+                sleep 2
+              fi
+            done
+
+            if [ "$DOWNLOAD_SUCCESS" = false ]; then
+              echo "❌ All methods failed for URL: $URL — skipping."
+              rm -rf "$TMP_DIR"
+              continue
+            fi
+
+            # شناسایی فایل ویدیویی دانلود شده
+            VIDEO_FILE=$(find "$TMP_DIR" -type f ! -name "*.jpg" ! -name "*.webp" | head -1)
+            THUMB_FILE=$(find "$TMP_DIR" -type f -name "*.jpg" -o -name "*.webp" | head -1)
+
+            if [ -z "$VIDEO_FILE" ]; then
+              echo "⚠️ No video file found, skipping."
+              rm -rf "$TMP_DIR"
+              continue
+            fi
+
+            FILENAME_NO_EXT=$(basename "$VIDEO_FILE" | sed 's/\.[^.]*$//' | sanitize_name)
+            EXT="${VIDEO_FILE##*.}"
+
+            # ساخت پوشه نهایی بسته
+            PACK_FOLDER="$BASE_DIR/${FILENAME_NO_EXT}"
+            mkdir -p "$PACK_FOLDER"
+
+            # کپی ویدیو به پوشه بسته
+            cp "$VIDEO_FILE" "$PACK_FOLDER/${FILENAME_NO_EXT}.${EXT}"
+
+            # کپی تصویر در صورت وجود
+            if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
+              cp "$THUMB_FILE" "$PACK_FOLDER/thumbnail.jpg"
+            fi
+
+            SIZE=$(stat -c%s "$VIDEO_FILE")
+            SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+
+            # ─── دانلود زیرنویس (اختیاری) ───
+            if [ "$DOWNLOAD_SUBS" = "true" ]; then
+              echo "  Fetching subtitles..."
+              SUB_DIR="$PACK_FOLDER/subtitle"
+              mkdir -p "$SUB_DIR"
+
+              yt-dlp --proxy "socks5://127.0.0.1:1080" --write-sub --sub-langs fa,en --write-auto-sub --sub-format vtt/srt/best --convert-subs vtt --skip-download --no-playlist --no-check-certificates --output "${SUB_DIR}/%(title)s" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" 2>/dev/null || echo "  Subtitle download had issues, but continuing..."
+            fi
+
+            # ─── ساخت README (دلخواه) ───
+            echo "# ${FILENAME_NO_EXT}" > "$PACK_FOLDER/README.md"
+            echo "" >> "$PACK_FOLDER/README.md"
+            echo "- **Size:** ${SIZE_MB} MB" >> "$PACK_FOLDER/README.md"
+            echo "- **Quality:** ${QUALITY}" >> "$PACK_FOLDER/README.md"
+            echo "- **Link:** $URL" >> "$PACK_FOLDER/README.md"
+
+            echo "✅ Package ready: $PACK_FOLDER"
+            rm -rf "$TMP_DIR"
+          done
+
+          echo ""
+          echo "===== Packages Summary ====="
+          ls -la "$BASE_DIR"
+
+          # ذخیره مسیر BASE_DIR برای استپ بعدی
+          echo "$BASE_DIR" > /tmp/artifact_dir.txt
+
+      - name: "📤 Upload Artifacts (1-Day Expiry)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-videos-${{ github.run_id }}
+          path: /home/runner/artifact_packages/*
+          retention-days: 1
+
+      - name: "🧹 Stop WARP Container"
         if: always()
         run: |
-          docker stop warp 2>/dev/null || true
-          docker rm warp 2>/dev/null || true
+          docker stop warp || true
+          docker rm warp || true
 
-      - name: Finalize & Push
-        if: always()
-        run: |
-          echo "📤 Saving to GitHub..."
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add downloads/
-          
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          
-          git commit -m "📥 YouTube Download $(date +%Y-%m-%d_%H-%M-%S) [skip ci]"
-          
-          echo "🚀 Pushing..."
-          git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || true
-          git push origin HEAD:${{ github.ref_name }}
-          
-          echo ""
-          echo "=============================="
-          echo " ✅ UPLOAD COMPLETE!"
-          echo "=============================="
-          echo ""
-          echo "📁 Download from:"
-          echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
-
-      - name: Show Results
+      - name: "✅ Final Report"
         run: |
           echo ""
-          echo "=============================="
-          echo " 📥 DOWNLOAD LINK"
-          echo "=============================="
+          echo "==============================================="
+          echo " DOWNLOAD COMPLETED SUCCESSFULLY!"
+          echo "==============================================="
+          echo " 📦 Artifact Name: youtube-videos-${{ github.run_id }}"
+          echo " ⏳ Expires in: 1 day"
+          echo " 🔗 Download Link: Check the 'Artifacts' section on this workflow run page."
           echo ""
-          echo "🔗 ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
-          echo ""
-          LATEST=$(ls -td downloads/yt_* downloads/yt_*_* 2>/dev/null | head -1)
-          if [ -n "$LATEST" ]; then
-            echo "🆕 Latest: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${LATEST}"
-          fi
+          echo " made in AVASAM (https://avasam.ir)"
+          echo "==============================================="
