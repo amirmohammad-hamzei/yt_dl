@@ -1,0 +1,311 @@
+name: "YouTube Downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_urls:
+        description: "YouTube URL"
+        required: true
+        type: string
+      quality:
+        description: "Video quality"
+        required: false
+        default: "best"
+        type: string
+      download_subtitles:
+        description: "Download subtitles"
+        required: false
+        default: "false"
+        type: string
+      password:
+        description: "Zip password"
+        required: false
+        default: ""
+        type: string
+      video_id:
+        description: "Video ID for unique folder"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  download-youtube:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+
+      - name: Start WARP Container
+        run: |
+          echo "Starting Cloudflare WARP..."
+          docker network create warp-net 2>/dev/null || true
+          docker run -d --name warp --restart=always --network warp-net -p 1080:1080 --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv4.conf.all.src_valid_mark=1 -v warp-data:/var/lib/cloudflare-warp caomingjun/warp
+          echo "Waiting for WARP..."
+          sleep 15
+          for i in 1 2 3 4 5; do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then echo "WARP ready!"; break; fi
+            sleep 5
+          done
+
+      - name: Cache Deno
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.deno
+          key: deno-${{ runner.os }}-stable
+
+      - name: Cache Python Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-ytdlp
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y python3-pip ffmpeg zip unzip curl bc p7zip-full 2>/dev/null
+          if [ ! -d "$HOME/.deno" ]; then curl -fsSL https://deno.land/install.sh | sh; fi
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+          pip3 install --upgrade --quiet yt-dlp 2>/dev/null
+          echo "Dependencies ready"
+
+      - name: Download Video
+        env:
+          YT_URLS: ${{ github.event.inputs.youtube_urls }}
+          YT_QUALITY: ${{ github.event.inputs.quality }}
+          YT_PASSWORD: ${{ github.event.inputs.password }}
+          DOWNLOAD_SUBS: ${{ github.event.inputs.download_subtitles }}
+          VIDEO_ID: ${{ github.event.inputs.video_id }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          URL="$YT_URLS"
+          QUALITY="$YT_QUALITY"
+          ZIP_PASSWORD="$YT_PASSWORD"
+          VIDEO_ID="${VIDEO_ID}"
+          SPLIT_MB=90
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          BACKUP_DIR="/tmp/video_backup"
+          rm -rf "$BACKUP_DIR"
+          mkdir -p "$BACKUP_DIR"
+          mkdir -p videos
+
+          sanitize_name() {
+            echo "$1" | sed 's/[^a-zA-Z0-9_-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//'
+          }
+
+          # Format selection
+          case "$QUALITY" in
+            "audio")
+              FORMAT="bestaudio/bestaudio*"
+              FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M"
+              ;;
+            "best")
+              FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best"
+              FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M"
+              ;;
+            *)
+              FORMAT="bestvideo[height<=${QUALITY}]+bestaudio/bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]"
+              FLAGS="--merge-output-format mp4 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M"
+              ;;
+          esac
+
+          echo "URL: $URL"
+          echo "Quality: $QUALITY"
+          echo "Format: $FORMAT"
+          echo ""
+
+          # Download function (8 methods)
+          download_video() {
+            local METHOD=$1
+            local URL=$2
+            local TMP_DIR=$3
+
+            case $METHOD in
+              1) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" --add-header "Accept-Language:en-US,en;q=0.9" "$URL" ;;
+              2) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" --add-header "Accept-Language:en-US,en;q=0.9" "$URL" ;;
+              3) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL" ;;
+              4) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=mweb" "$URL" ;;
+              5) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=android_vr" "$URL" ;;
+              6) yt-dlp --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" ;;
+              7) yt-dlp --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=mweb" "$URL" ;;
+              8) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $FLAGS --output "${TMP_DIR}/%(title)s.%(ext)s" --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N) AppleWebKit/537.36" "$URL" ;;
+            esac
+          }
+
+          TMP_DIR="tmp_downloads_${VIDEO_ID:-1}"
+          mkdir -p "$TMP_DIR"
+
+          # Try all methods
+          DOWNLOAD_SUCCESS=false
+          for METHOD in 1 2 3 4 5 6 7 8; do
+            echo "Method $METHOD..."
+            if download_video $METHOD "$URL" "$TMP_DIR"; then
+              echo "Method $METHOD SUCCESS"
+              DOWNLOAD_SUCCESS=true
+              break
+            fi
+            echo "Method $METHOD FAILED"
+            sleep 3
+          done
+
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "ERROR: All download methods failed!"
+            exit 1
+          fi
+
+          # Clean temp files
+          find "$TMP_DIR" -name "*.part" -delete 2>/dev/null || true
+          find "$TMP_DIR" -name "*.ytdl" -delete 2>/dev/null || true
+
+          # Find media file
+          MEDIA_FILE=$(find "$TMP_DIR" -type f \( -name "*.mp4" -o -name "*.webm" -o -name "*.mkv" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.opus" -o -name "*.ogg" -o -name "*.aac" -o -name "*.flac" \) ! -name "*.part" ! -name "*.ytdl" 2>/dev/null | head -1)
+
+          if [ -z "$MEDIA_FILE" ]; then
+            echo "FALLBACK: checking all files..."
+            find "$TMP_DIR" -type f
+            MEDIA_FILE=$(find "$TMP_DIR" -type f ! -name "*.jpg" ! -name "*.webp" ! -name "*.png" ! -name "*.part" ! -name "*.ytdl" 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$MEDIA_FILE" ]; then
+            echo "ERROR: No media file found!"
+            ls -la "$TMP_DIR/"
+            exit 1
+          fi
+
+          SIZE=$(stat -c%s "$MEDIA_FILE")
+          SIZE_MB=$(( SIZE / 1048576 ))
+          BASENAME=$(basename "$MEDIA_FILE")
+          FILENAME_NO_EXT="${BASENAME%.*}"
+          EXT="${BASENAME##*.}"
+
+          FILENAME_NO_EXT=$(sanitize_name "$FILENAME_NO_EXT")
+
+          echo "File: $BASENAME"
+          echo "Size: ${SIZE_MB}MB"
+          echo "Safe name: $FILENAME_NO_EXT"
+
+          FINAL_FOLDER="$BACKUP_DIR/${FILENAME_NO_EXT}"
+          mkdir -p "$FINAL_FOLDER"
+
+          # Copy thumbnail
+          THUMB_FILE=$(find "$TMP_DIR" -maxdepth 1 -type f \( -name "*.jpg" -o -name "*.webp" -o -name "*.png" \) 2>/dev/null | head -1)
+          if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
+            cp "$THUMB_FILE" "$FINAL_FOLDER/thumbnail.jpg"
+          fi
+
+          # Subtitles
+          if [ "$DOWNLOAD_SUBS" = "true" ]; then
+            SUB_DIR="$FINAL_FOLDER/subtitles"
+            mkdir -p "$SUB_DIR"
+            yt-dlp --proxy "socks5://127.0.0.1:1080" --write-sub --sub-langs "fa,en" --write-auto-sub --sub-format vtt --convert-subs vtt --skip-download --no-playlist --output "$SUB_DIR/%(title)s" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" 2>/dev/null || {
+              yt-dlp --write-sub --sub-langs "fa,en" --write-auto-sub --sub-format vtt --convert-subs vtt --skip-download --no-playlist --output "$SUB_DIR/%(title)s" --extractor-args "youtube:player_client=mweb" "$URL" 2>/dev/null || echo "No subtitles available"
+            }
+            [ -z "$(ls -A "$SUB_DIR" 2>/dev/null)" ] && rmdir "$SUB_DIR" 2>/dev/null || true
+          fi
+
+          # Decision: split or direct
+          if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
+            echo "File > ${SPLIT_MB}MB - splitting..."
+            
+            # Create zip archive and split
+            cd "$FINAL_FOLDER"
+            if [ -n "$ZIP_PASSWORD" ]; then
+              zip -r -P "$ZIP_PASSWORD" -s ${SPLIT_MB}m "../${FILENAME_NO_EXT}.zip" ./* > /dev/null 2>&1
+            else
+              zip -r -s ${SPLIT_MB}m "../${FILENAME_NO_EXT}.zip" ./* > /dev/null 2>&1
+            fi
+            cd -
+
+            rm -rf "$FINAL_FOLDER"
+            mkdir -p "$FINAL_FOLDER"
+            
+            # Move all split files
+            mv "$BACKUP_DIR/${FILENAME_NO_EXT}.zip"* "$FINAL_FOLDER/" 2>/dev/null || true
+            mv "$BACKUP_DIR/${FILENAME_NO_EXT}.z"* "$FINAL_FOLDER/" 2>/dev/null || true
+            
+            echo "Split files:"
+            ls -la "$FINAL_FOLDER/"
+
+          else
+            echo "File < ${SPLIT_MB}MB - direct copy"
+            
+            # Direct copy
+            cp "$MEDIA_FILE" "$FINAL_FOLDER/${FILENAME_NO_EXT}.${EXT}"
+
+            if [ -n "$ZIP_PASSWORD" ]; then
+              # Create password-protected zip (single file)
+              cd "$FINAL_FOLDER"
+              zip -r -P "$ZIP_PASSWORD" "../${FILENAME_NO_EXT}.zip" ./* > /dev/null 2>&1
+              cd -
+              rm -rf "$FINAL_FOLDER"/*
+              mv "$BACKUP_DIR/${FILENAME_NO_EXT}.zip" "$FINAL_FOLDER/"
+            fi
+
+            echo "Files:"
+            ls -la "$FINAL_FOLDER/"
+          fi
+
+          # Create .md5 completion marker
+          echo "$(date -u +%s)" > "$FINAL_FOLDER/.md5"
+
+          # Copy to videos/
+          cp -r "$FINAL_FOLDER" "videos/"
+          
+          echo "Done!"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+
+      - name: Push to Repository
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          
+          git add videos/
+          
+          if git diff --cached --quiet 2>/dev/null; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          git commit -m "Downloaded video [skip ci]" 2>/dev/null || true
+          
+          for i in 1 2 3 4 5; do
+            echo "Push attempt $i/5..."
+            if timeout 120 git push origin HEAD:${{ github.ref_name }} 2>&1; then
+              echo "Push successful!"
+              exit 0
+            fi
+            echo "Push failed, retrying in 5s..."
+            sleep 5
+            git fetch origin ${{ github.ref_name }} 2>/dev/null || true
+            git reset --hard origin/${{ github.ref_name }} 2>/dev/null || true
+            cp -r /tmp/video_backup/* videos/ 2>/dev/null || true
+            git add videos/
+            git commit -m "Downloaded video [skip ci]" 2>/dev/null || true
+          done
+          
+          echo "Push completed (with retries if needed)"
+
+      - name: Stop WARP
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
