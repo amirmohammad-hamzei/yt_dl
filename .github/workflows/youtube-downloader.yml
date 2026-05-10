@@ -271,17 +271,19 @@ jobs:
               fi
             fi
 
-            # --- info file ---
-            cat > "$PKG/info.txt" << EOF
-Name: $SAFE
-URL: $URL
-Size: ${MSIZE_MB} MB
-Quality: $QUALITY
-Format: $EXT
-Date: $(date -u +"%Y-%m-%d %H:%M UTC")
-Subtitles: $DOWNLOAD_SUBS
-Password: $([ -n "$ZIP_PASSWORD" ] && echo "YES" || echo "NO")
-EOF
+            # --- info file (using echo instead of heredoc) ---
+            echo "Name: $SAFE" > "$PKG/info.txt"
+            echo "URL: $URL" >> "$PKG/info.txt"
+            echo "Size: ${MSIZE_MB} MB" >> "$PKG/info.txt"
+            echo "Quality: $QUALITY" >> "$PKG/info.txt"
+            echo "Format: $EXT" >> "$PKG/info.txt"
+            echo "Date: $(date -u +"%Y-%m-%d %H:%M UTC")" >> "$PKG/info.txt"
+            echo "Subtitles: $DOWNLOAD_SUBS" >> "$PKG/info.txt"
+            if [ -n "$ZIP_PASSWORD" ]; then
+              echo "Password: YES" >> "$PKG/info.txt"
+            else
+              echo "Password: NO" >> "$PKG/info.txt"
+            fi
 
             # --- password zip ---
             if [ -n "$ZIP_PASSWORD" ]; then
