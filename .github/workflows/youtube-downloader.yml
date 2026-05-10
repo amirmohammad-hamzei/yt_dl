@@ -1,19 +1,19 @@
-name: "🎬 YouTube Downloader"
+name: "YouTube Downloader"
 
 on:
   workflow_dispatch:
     inputs:
       youtube_urls:
-        description: "🔗 YouTube video URLs — separate with spaces"
+        description: "YouTube video URLs - separate with spaces"
         required: true
         type: string
       download_subtitles:
-        description: "📝 Download subtitles (English & Persian)"
+        description: "Download subtitles (English & Persian)"
         required: false
         default: false
         type: boolean
       quality:
-        description: "🎬 Video quality"
+        description: "Video quality"
         required: false
         default: "best"
         type: choice
@@ -26,7 +26,7 @@ on:
           - 480
           - audio
       password:
-        description: "🔒 Password for zip file (optional)"
+        description: "Password for zip file (optional)"
         required: false
         default: ""
         type: string
@@ -39,19 +39,18 @@ jobs:
       contents: read
 
     steps:
-      - name: "⚙️ Configure Environment"
+      - name: "Configure Environment"
         run: |
-          echo "YouTube Downloader - Starting up..."
-          echo "============================================="
+          echo "============================================"
+          echo " YouTube Downloader - Starting"
           echo " Quality: ${{ github.event.inputs.quality }}"
           echo " Subtitles: ${{ github.event.inputs.download_subtitles }}"
-          echo " Password Protected: ${{ github.event.inputs.password != '' }}"
-          echo "============================================="
+          echo "============================================"
 
-      - name: "🌐 Start WARP Container (Anti-Throttle)"
+      - name: "Start WARP Proxy"
         run: |
-          echo "Starting Cloudflare WARP proxy..."
-          docker network create warp-net || true
+          echo "Starting Cloudflare WARP..."
+          docker network create warp-net 2>/dev/null || true
           docker run -d \
             --name warp \
             --restart=always \
@@ -66,34 +65,32 @@ jobs:
           echo "Waiting for WARP (15s)..."
           sleep 15
 
-          echo "Checking WARP status..."
-          for i in {1..5}; do
+          for i in 1 2 3 4 5; do
             RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
             if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
-              echo "✅ WARP connected!"
+              echo "WARP connected OK"
               break
             else
-              echo "⏳ Attempt $i/5..."
+              echo "WARP check $i/5 - waiting..."
               sleep 5
             fi
           done
 
-      - name: "📦 Install Required Tools"
+      - name: "Install Dependencies"
         run: |
-          echo "Installing dependencies..."
+          echo "Installing packages..."
           sudo apt-get update -qq
           sudo apt-get install -y python3-pip ffmpeg zip p7zip-full curl jq bc unzip
 
-          # Deno (required for YouTube JS challenge solving)
           curl -fsSL https://deno.land/install.sh | sh
           export DENO_INSTALL="$HOME/.deno"
           export PATH="$DENO_INSTALL/bin:$PATH"
           echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
 
           pip3 install --upgrade yt-dlp
-          echo "✅ All dependencies installed."
+          echo "Dependencies ready"
 
-      - name: "🎯 Download Videos"
+      - name: "Download and Package"
         env:
           YT_URLS: ${{ github.event.inputs.youtube_urls }}
           YT_QUALITY: ${{ github.event.inputs.quality }}
@@ -102,9 +99,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ============================================================
-          # PARSE INPUTS
-          # ============================================================
           read -ra URL_LIST <<< "$YT_URLS"
           TOTAL_URLS=${#URL_LIST[@]}
           QUALITY="$YT_QUALITY"
@@ -114,25 +108,19 @@ jobs:
           mkdir -p "$BASE_DIR"
 
           echo ""
-          echo "=================================================="
+          echo "============================================"
           echo " DOWNLOAD STARTING"
-          echo "=================================================="
-          echo " Total URLs: $TOTAL_URLS"
+          echo " URLs: $TOTAL_URLS"
           echo " Quality: $QUALITY"
           echo " Subtitles: ${DOWNLOAD_SUBS}"
-          echo "=================================================="
-          echo ""
+          echo "============================================"
 
-          # ============================================================
-          # HELPER FUNCTIONS
-          # ============================================================
+          # --- helper ---
           sanitize_name() {
-            echo "$1" | sed 's/[^a-zA-Z0-9آ-ی_-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//'
+            echo "$1" | sed 's/[^a-zA-Z0-9_-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//'
           }
 
-          # ============================================================
-          # FORMAT SELECTION
-          # ============================================================
+          # --- format ---
           case "$QUALITY" in
             audio)
               FORMAT="bestaudio/best"
@@ -168,310 +156,172 @@ jobs:
               ;;
           esac
 
-          echo "Format string: $FORMAT"
-          echo "Post flags: $POST_FLAGS"
+          echo "Format: $FORMAT"
           echo ""
 
-          # ============================================================
-          # DOWNLOAD FUNCTION (8 methods)
-          # ============================================================
-          download_with_method() {
-            local METHOD=$1
-            local URL=$2
-            local OUTDIR=$3
+          # --- download function ---
+          dl() {
+            local M=$1
+            local U=$2
+            local O=$3
+            local C="--format $FORMAT $POST_FLAGS --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${O}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
 
-            local COMMON="--format $FORMAT $POST_FLAGS --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${OUTDIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
-
-            case $METHOD in
-              1)
-                yt-dlp --proxy socks5://127.0.0.1:1080 $COMMON \
-                  --extractor-args "youtube:player_client=web" \
-                  --js-runtimes deno \
-                  --remote-components ejs:github \
-                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-                  "$URL"
-                ;;
-              2)
-                yt-dlp --proxy socks5://127.0.0.1:1080 $COMMON \
-                  --extractor-args "youtube:player_client=web" \
-                  --js-runtimes deno \
-                  --remote-components ejs:npm \
-                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  "$URL"
-                ;;
-              3)
-                yt-dlp --proxy socks5://127.0.0.1:1080 $COMMON \
-                  --extractor-args "youtube:player_client=web,mweb,android_vr" \
-                  --js-runtimes deno \
-                  --remote-components ejs:github \
-                  "$URL"
-                ;;
-              4)
-                yt-dlp --proxy socks5://127.0.0.1:1080 $COMMON \
-                  --extractor-args "youtube:player_client=mweb" \
-                  "$URL"
-                ;;
-              5)
-                yt-dlp --proxy socks5://127.0.0.1:1080 $COMMON \
-                  --extractor-args "youtube:player_client=android_vr" \
-                  "$URL"
-                ;;
-              6)
-                yt-dlp $COMMON \
-                  --extractor-args "youtube:player_client=web" \
-                  --js-runtimes deno \
-                  --remote-components ejs:github \
-                  "$URL"
-                ;;
-              7)
-                yt-dlp $COMMON \
-                  --extractor-args "youtube:player_client=mweb" \
-                  "$URL"
-                ;;
-              8)
-                yt-dlp --proxy socks5://127.0.0.1:1080 $COMMON \
-                  --extractor-args "youtube:player_client=android" \
-                  --user-agent "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36" \
-                  "$URL"
-                ;;
+            case $M in
+              1) yt-dlp --proxy socks5://127.0.0.1:1080 $C --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "$U" ;;
+              2) yt-dlp --proxy socks5://127.0.0.1:1080 $C --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$U" ;;
+              3) yt-dlp --proxy socks5://127.0.0.1:1080 $C --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$U" ;;
+              4) yt-dlp --proxy socks5://127.0.0.1:1080 $C --extractor-args "youtube:player_client=mweb" "$U" ;;
+              5) yt-dlp --proxy socks5://127.0.0.1:1080 $C --extractor-args "youtube:player_client=android_vr" "$U" ;;
+              6) yt-dlp $C --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$U" ;;
+              7) yt-dlp $C --extractor-args "youtube:player_client=mweb" "$U" ;;
+              8) yt-dlp --proxy socks5://127.0.0.1:1080 $C --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36" "$U" ;;
             esac
           }
 
-          # ============================================================
-          # SUBTITLE DOWNLOAD FUNCTION
-          # ============================================================
-          download_subtitles_func() {
-            local URL=$1
-            local OUTDIR=$2
-
-            mkdir -p "$OUTDIR"
-
-            yt-dlp --proxy socks5://127.0.0.1:1080 \
-              --write-sub --sub-langs "fa,en" \
-              --write-auto-sub \
-              --sub-format "vtt/srt/best" \
-              --convert-subs vtt \
-              --skip-download \
-              --no-playlist \
-              --no-check-certificates \
-              --output "${OUTDIR}/%(title)s" \
-              --extractor-args "youtube:player_client=web" \
-              --js-runtimes deno \
-              --remote-components ejs:github \
-              "$URL" 2>/dev/null || {
-                # Fallback: try without proxy
-                yt-dlp \
-                  --write-sub --sub-langs "fa,en" \
-                  --write-auto-sub \
-                  --sub-format "vtt/srt/best" \
-                  --convert-subs vtt \
-                  --skip-download \
-                  --no-playlist \
-                  --no-check-certificates \
-                  --output "${OUTDIR}/%(title)s" \
-                  --extractor-args "youtube:player_client=mweb" \
-                  "$URL" 2>/dev/null || echo "⚠️ Could not download subtitles"
-              }
+          # --- subtitle function ---
+          sub_dl() {
+            local U=$1
+            local O=$2
+            mkdir -p "$O"
+            yt-dlp --proxy socks5://127.0.0.1:1080 --write-sub --sub-langs "fa,en" --write-auto-sub --sub-format "vtt/srt/best" --convert-subs vtt --skip-download --no-playlist --no-check-certificates --output "${O}/%(title)s" --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$U" 2>/dev/null || {
+              yt-dlp --write-sub --sub-langs "fa,en" --write-auto-sub --sub-format "vtt/srt/best" --convert-subs vtt --skip-download --no-playlist --no-check-certificates --output "${O}/%(title)s" --extractor-args "youtube:player_client=mweb" "$U" 2>/dev/null || echo "Subtitle download failed"
+            }
           }
 
-          # ============================================================
-          # PROCESS EACH URL
-          # ============================================================
-          URL_INDEX=0
+          # --- process each URL ---
+          IDX=0
           for URL in "${URL_LIST[@]}"; do
-            URL_INDEX=$((URL_INDEX + 1))
-
+            IDX=$((IDX + 1))
             echo ""
-            echo "============================================================"
-            echo " [${URL_INDEX}/${TOTAL_URLS}] Processing: $URL"
-            echo "============================================================"
+            echo "--- [$IDX/$TOTAL_URLS] $URL ---"
 
             # Normalize short URLs
             if [[ "$URL" =~ youtu\.be/([a-zA-Z0-9_-]+) ]]; then
-              VIDEO_ID="${BASH_REMATCH[1]}"
-              VIDEO_ID="${VIDEO_ID%%\?*}"
-              URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
-              echo " → Normalized: $URL"
+              VID="${BASH_REMATCH[1]}"
+              VID="${VID%%\?*}"
+              URL="https://www.youtube.com/watch?v=${VID}"
+              echo "Normalized: $URL"
             fi
 
-            TMP_DIR="/tmp/dl_${URL_INDEX}"
-            mkdir -p "$TMP_DIR"
+            TMP="/tmp/dl_${IDX}"
+            mkdir -p "$TMP"
 
-            # Try all download methods
-            DOWNLOAD_SUCCESS=false
-            for METHOD in 1 2 3 4 5 6 7 8; do
-              echo ""
-              echo " → Attempting method $METHOD..."
-              if download_with_method $METHOD "$URL" "$TMP_DIR"; then
-                echo " ✅ Method $METHOD successful!"
-                DOWNLOAD_SUCCESS=true
+            OK=false
+            for M in 1 2 3 4 5 6 7 8; do
+              echo "Method $M..."
+              if dl $M "$URL" "$TMP"; then
+                echo "Method $M SUCCESS"
+                OK=true
                 break
               else
-                echo " ❌ Method $METHOD failed."
+                echo "Method $M FAILED"
                 sleep 2
               fi
             done
 
-            if [ "$DOWNLOAD_SUCCESS" = false ]; then
-              echo ""
-              echo " ⛔ ALL METHODS FAILED for: $URL"
-              echo " ⛔ Skipping this URL..."
-              rm -rf "$TMP_DIR"
+            if [ "$OK" = false ]; then
+              echo "ALL METHODS FAILED for: $URL"
+              rm -rf "$TMP"
               continue
             fi
 
-            # ============================================================
-            # FIND DOWNLOADED FILES (IMPROVED DETECTION)
-            # ============================================================
-            echo ""
-            echo " → Scanning downloaded files..."
+            echo "Files in temp:"
+            ls -lah "$TMP/" 2>/dev/null || echo "(empty)"
 
-            # List all files for debugging
-            echo " Files in temp dir:"
-            ls -lah "$TMP_DIR/" 2>/dev/null || echo " (empty)"
+            # --- find media file ---
+            MEDIA=$(find "$TMP" -type f \( -name "*.mp4" -o -name "*.webm" -o -name "*.mkv" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.opus" -o -name "*.ogg" -o -name "*.aac" -o -name "*.flac" \) ! -name "*.part" ! -name "*.ytdl" 2>/dev/null | head -1)
+            THUMB=$(find "$TMP" -type f \( -name "*.jpg" -o -name "*.webp" -o -name "*.png" \) 2>/dev/null | head -1)
 
-            # Find video/audio file - exclude thumbnails and part files
-            MEDIA_FILE=$(find "$TMP_DIR" -type f \
-              \( -name "*.mp4" -o -name "*.webm" -o -name "*.mkv" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.opus" -o -name "*.ogg" -o -name "*.aac" -o -name "*.flac" \) \
-              ! -name "*.part" \
-              ! -name "*.ytdl" \
-              2>/dev/null | head -1)
-
-            THUMB_FILE=$(find "$TMP_DIR" -type f \( -name "*.jpg" -o -name "*.webp" -o -name "*.png" \) 2>/dev/null | head -1)
-
-            if [ -z "$MEDIA_FILE" ]; then
-              echo " ⛔ WARNING: No media file found in download directory!"
-              echo " ⛔ Only thumbnail detected. Possible causes:"
-              echo "    1. YouTube blocked the request (geo-restriction, age gate, etc.)"
-              echo "    2. Video is private/deleted"
-              echo "    3. Format not available for this video"
-              echo "    4. Network/proxy issue"
-              echo ""
-              echo " Files present:"
-              find "$TMP_DIR" -type f -exec ls -lh {} \;
-              rm -rf "$TMP_DIR"
+            if [ -z "$MEDIA" ]; then
+              echo "ERROR: No media file found! Check list above."
+              echo "Possible reasons: geo-block, age gate, private video, format not available"
+              rm -rf "$TMP"
               continue
             fi
 
-            MEDIA_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
-            MEDIA_SIZE_MB=$(echo "scale=1; $MEDIA_SIZE / 1048576" | bc 2>/dev/null || echo "0")
+            MSIZE=$(stat -c%s "$MEDIA" 2>/dev/null || echo 0)
+            MSIZE_MB=$(echo "scale=1; $MSIZE / 1048576" | bc 2>/dev/null || echo "0")
 
-            echo " ✅ Media file: $(basename "$MEDIA_FILE") (${MEDIA_SIZE_MB} MB)"
-            [ -n "$THUMB_FILE" ] && echo " ✅ Thumbnail: $(basename "$THUMB_FILE")"
+            echo "Media: $(basename "$MEDIA") (${MSIZE_MB} MB)"
+            [ -n "$THUMB" ] && echo "Thumbnail: $(basename "$THUMB")"
 
-            # ============================================================
-            # SANITIZE NAME & CREATE PACKAGE
-            # ============================================================
-            RAW_NAME=$(basename "$MEDIA_FILE" | sed 's/\.[^.]*$//')
-            SAFE_NAME=$(sanitize_name "$RAW_NAME")
-            EXT="${MEDIA_FILE##*.}"
+            RAW=$(basename "$MEDIA" | sed 's/\.[^.]*$//')
+            SAFE=$(sanitize_name "$RAW")
+            EXT="${MEDIA##*.}"
 
-            PACK_DIR="$BASE_DIR/$SAFE_NAME"
-            mkdir -p "$PACK_DIR"
+            PKG="$BASE_DIR/$SAFE"
+            mkdir -p "$PKG"
 
-            cp "$MEDIA_FILE" "$PACK_DIR/${SAFE_NAME}.${EXT}"
-            [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ] && cp "$THUMB_FILE" "$PACK_DIR/thumbnail.jpg"
+            cp "$MEDIA" "$PKG/${SAFE}.${EXT}"
+            [ -n "$THUMB" ] && [ -f "$THUMB" ] && cp "$THUMB" "$PKG/thumbnail.jpg"
 
-            echo " → Copied to: $PACK_DIR/${SAFE_NAME}.${EXT}"
+            echo "Copied to: $PKG/${SAFE}.${EXT}"
 
-            # ============================================================
-            # DOWNLOAD SUBTITLES (OPTIONAL)
-            # ============================================================
+            # --- subtitles ---
             if [ "$DOWNLOAD_SUBS" = "true" ]; then
-              echo " → Downloading subtitles..."
-              SUB_DIR="$PACK_DIR/subtitles"
-              download_subtitles_func "$URL" "$SUB_DIR"
-
-              SUB_COUNT=$(find "$SUB_DIR" -type f 2>/dev/null | wc -l)
-              if [ "$SUB_COUNT" -gt 0 ]; then
-                echo " ✅ Downloaded $SUB_COUNT subtitle file(s)"
+              echo "Downloading subtitles..."
+              SUBD="$PKG/subtitles"
+              sub_dl "$URL" "$SUBD"
+              SC=$(find "$SUBD" -type f 2>/dev/null | wc -l)
+              if [ "$SC" -gt 0 ]; then
+                echo "Subtitles: $SC file(s)"
               else
-                echo " ⚠️ No subtitles available"
-                rmdir "$SUB_DIR" 2>/dev/null || true
+                echo "No subtitles available"
+                rmdir "$SUBD" 2>/dev/null || true
               fi
             fi
 
-            # ============================================================
-            # CREATE INFO FILE
-            # ============================================================
-            cat > "$PACK_DIR/info.txt" << EOF
-Video Information
-=================
-Name: $SAFE_NAME
-Original URL: $URL
-Size: ${MEDIA_SIZE_MB} MB
+            # --- info file ---
+            cat > "$PKG/info.txt" << EOF
+Name: $SAFE
+URL: $URL
+Size: ${MSIZE_MB} MB
 Quality: $QUALITY
 Format: $EXT
-Download Date: $(date -u +"%Y-%m-%d %H:%M UTC")
+Date: $(date -u +"%Y-%m-%d %H:%M UTC")
 Subtitles: $DOWNLOAD_SUBS
-Password Protected: $([ -n "$ZIP_PASSWORD" ] && echo "YES" || echo "NO")
+Password: $([ -n "$ZIP_PASSWORD" ] && echo "YES" || echo "NO")
 EOF
 
-            echo " ✅ Info file created"
-
-            # ============================================================
-            # ZIP IF PASSWORD REQUESTED
-            # ============================================================
+            # --- password zip ---
             if [ -n "$ZIP_PASSWORD" ]; then
-              echo " → Creating password-protected zip..."
-              cd "$PACK_DIR"
-              zip -r -P "$ZIP_PASSWORD" "../${SAFE_NAME}.zip" ./* > /dev/null 2>&1
+              echo "Creating password zip..."
+              cd "$PKG"
+              zip -r -P "$ZIP_PASSWORD" "../${SAFE}.zip" ./* > /dev/null 2>&1
               cd - > /dev/null
-              rm -rf "$PACK_DIR"
-              mkdir -p "$PACK_DIR"
-              mv "$BASE_DIR/${SAFE_NAME}.zip" "$PACK_DIR/"
-              echo " ✅ Password-protected zip created"
+              rm -rf "$PKG"
+              mkdir -p "$PKG"
+              mv "$BASE_DIR/${SAFE}.zip" "$PKG/"
             fi
 
-            # Cleanup
-            rm -rf "$TMP_DIR"
-            echo ""
-            echo " ✅ Done: $SAFE_NAME"
+            rm -rf "$TMP"
+            echo "Done: $SAFE"
           done
 
-          # ============================================================
-          # FINAL SUMMARY
-          # ============================================================
+          # --- final check ---
           echo ""
-          echo "============================================================"
-          echo " DOWNLOAD SUMMARY"
-          echo "============================================================"
-          echo ""
+          echo "============================================"
+          echo " SUMMARY"
+          echo "============================================"
 
-          FINAL_COUNT=$(find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
-          if [ "$FINAL_COUNT" -eq 0 ]; then
-            echo " ⛔ NO VIDEOS WERE DOWNLOADED SUCCESSFULLY"
-            echo " ⛔ Check the logs above for errors."
-            echo " ⛔ Common issues:"
-            echo "    - Video is geo-blocked"
-            echo "    - Video is private or does not exist"
-            echo "    - WARP proxy not working properly"
-            echo "    - YouTube anti-bot measures"
-            echo ""
-            echo " Files in output directory:"
-            ls -la "$BASE_DIR/" 2>/dev/null || echo " (empty)"
+          FC=$(find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+          if [ "$FC" -eq 0 ]; then
+            echo "NO VIDEOS DOWNLOADED"
+            echo "Check error messages above"
             exit 1
           fi
 
-          echo " Successfully downloaded $FINAL_COUNT video(s):"
-          echo ""
-          for dir in "$BASE_DIR"/*/; do
-            [ -d "$dir" ] || continue
-            DIRNAME=$(basename "$dir")
-            FILES_IN=$(find "$dir" -type f | wc -l)
-            TOTAL_SIZE=$(du -sh "$dir" 2>/dev/null | cut -f1)
-            echo "  📁 $DIRNAME ($TOTAL_SIZE, $FILES_IN files)"
+          echo "Downloaded $FC video(s):"
+          for d in "$BASE_DIR"/*/; do
+            [ -d "$d" ] || continue
+            DN=$(basename "$d")
+            DS=$(du -sh "$d" 2>/dev/null | cut -f1)
+            echo "  $DN ($DS)"
           done
 
-          echo ""
-          echo "============================================================"
-          echo " All downloads complete! Uploading artifacts..."
-          echo "============================================================"
-
-          # Save path for next step
           echo "$BASE_DIR" > /tmp/output_dir.txt
 
-      - name: "📤 Upload Artifacts (1 Day Expiry)"
+      - name: "Upload Artifacts (1 Day Expiry)"
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -479,25 +329,19 @@ EOF
           path: /home/runner/output/*
           retention-days: 1
 
-      - name: "🧹 Cleanup WARP"
+      - name: "Stop WARP"
         if: always()
         run: |
-          echo "Stopping WARP container..."
           docker stop warp 2>/dev/null || true
           docker rm warp 2>/dev/null || true
-          echo "Cleanup complete."
 
-      - name: "✅ Done"
+      - name: "Complete"
         if: success()
         run: |
           echo ""
-          echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║                                                          ║"
-          echo "║              DOWNLOAD COMPLETED SUCCESSFULLY              ║"
-          echo "║                                                          ║"
-          echo "║   📦 Artifact: downloaded-videos                         ║"
-          echo "║   ⏳ Expires in: 1 day                                   ║"
-          echo "║   📥 Download from: Artifacts section on this page       ║"
-          echo "║                                                          ║"
-          echo "╚══════════════════════════════════════════════════════════╝"
-          echo ""
+          echo "============================================"
+          echo " DOWNLOAD COMPLETED"
+          echo " Artifact: downloaded-videos"
+          echo " Expires in: 1 day"
+          echo " Check Artifacts section to download"
+          echo "============================================"
